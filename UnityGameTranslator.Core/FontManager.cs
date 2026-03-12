@@ -49,19 +49,34 @@ namespace UnityGameTranslator.Core
             {
                 if (_systemFonts == null)
                 {
-                    try
-                    {
-                        _systemFonts = Font.GetOSInstalledFontNames();
-                        if (_systemFonts == null)
-                            _systemFonts = new string[0];
-                    }
-                    catch (Exception ex)
-                    {
-                        TranslatorCore.LogWarning($"[FontManager] Failed to get system fonts: {ex.Message}");
-                        _systemFonts = new string[0];
-                    }
+                    _systemFonts = TryGetOSInstalledFontNames();
                 }
                 return _systemFonts;
+            }
+        }
+
+        /// <summary>
+        /// Safely get installed font names via reflection.
+        /// Font.GetOSInstalledFontNames() doesn't exist in all Unity versions/runtimes.
+        /// </summary>
+        private static string[] TryGetOSInstalledFontNames()
+        {
+            try
+            {
+                var method = typeof(Font).GetMethod("GetOSInstalledFontNames",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (method != null)
+                {
+                    var result = method.Invoke(null, null) as string[];
+                    return result ?? new string[0];
+                }
+                TranslatorCore.LogInfo("[FontManager] GetOSInstalledFontNames not available on this Unity version");
+                return new string[0];
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogWarning($"[FontManager] Failed to get system fonts: {ex.Message}");
+                return new string[0];
             }
         }
 
