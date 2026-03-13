@@ -2,13 +2,13 @@
 
 **Website:** [unitygametranslator.asymptomatikgames.com](https://unitygametranslator.asymptomatikgames.com)
 
-A universal translation mod for Unity games with local AI (Ollama) and online community translations.
+A universal translation mod for Unity games with AI translation (any OpenAI-compatible server — local or cloud) and online community translations. Works fully offline with a local AI server like Ollama or LM Studio — no API key, no internet, no cost.
 
 ## Features
 
 ### Translation Engine
 - **Runtime translation** - text is translated as you encounter it in-game
-- **Local AI translation** via Ollama (no internet required, no API costs)
+- **AI translation** via any OpenAI-compatible server — run locally (Ollama, LM Studio) for free, offline translation or use cloud providers (Groq, OpenRouter, OpenAI)
 - **Instant cache hits** - cached translations apply synchronously
 - **Number normalization** - "Kill 5 enemies" and "Kill 10 enemies" share the same translation
 - **Auto language detection** - detects system language as target
@@ -26,7 +26,7 @@ A universal translation mod for Unity games with local AI (Ollama) and online co
 ### In-Game Overlay
 - **Settings hotkey** - press F10 (configurable) to open settings
 - **First-run wizard** - guided setup on first launch
-- **Ollama configuration** - test connection, select model, set game context
+- **AI configuration** - test connection, select model, set game context, optional API key
 - **Sync options** - configure update checking and merge behavior
 - **Translation info** - view current translation source and local changes
 - **Login/Upload** - authenticate and upload translations without leaving the game
@@ -79,25 +79,38 @@ On first launch, the mod displays a setup wizard:
 2. **Online mode** - choose to enable community features or stay offline
 3. **Settings hotkey** - pick a key to open settings (default: F10)
 4. **Translation search** - if online, search for existing translations
-5. **Ollama setup** - configure local AI translation (optional)
+5. **AI setup** - configure AI translation server and model (optional)
 
 After setup, press the hotkey anytime to open settings.
 
 ### 4. Enable AI translation (optional)
 
-By default, the plugin only uses cached/downloaded translations. To enable live AI translation:
+By default, the plugin only uses cached/downloaded translations. To enable live AI translation, you need any server that exposes the OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`).
 
-1. Install Ollama: https://ollama.ai
-2. Download a model:
-   ```
-   ollama pull qwen3:8b
-   ```
-3. Open settings (F10) and enable Ollama, or edit `config.json`:
-   ```json
-   "enable_ollama": true
-   ```
+#### Local servers (free, offline)
 
-> **Recommended model:** `qwen3:8b` is the tested and optimized model (requires ~6-8 GB VRAM). It provides the best balance of speed, quality, and multilingual support. Other models may work but are experimental.
+| Server | Description |
+|--------|-------------|
+| [Ollama](https://ollama.ai/) | Easy to install, run `ollama pull qwen3:8b` to get started |
+| [LM Studio](https://lmstudio.ai/) | Desktop app with model browser |
+
+#### Cloud providers (requires API key)
+
+| Provider | Description |
+|----------|-------------|
+| [Groq](https://groq.com/) | Free tier available, very fast inference |
+| [OpenRouter](https://openrouter.ai/) | Aggregator with many models, free tier available |
+| [OpenAI](https://platform.openai.com/) | GPT models |
+
+**Setup:**
+1. Open settings (F10) → AI Translation tab
+2. Enter the server URL (e.g., `http://localhost:11434` for Ollama)
+3. Add an API key if required (cloud providers)
+4. Click **Test** to verify the connection
+5. Select a model from the dropdown
+6. Enable AI translation
+
+> **Recommended local model:** `qwen3:8b` provides the best balance of speed, quality, and multilingual support (requires ~6-8 GB VRAM).
 
 ## Configuration
 
@@ -107,15 +120,16 @@ Config file location:
 
 ```json
 {
-  "ollama_url": "http://localhost:11434",
-  "model": "qwen3:8b",
+  "ai_url": "http://localhost:11434",
+  "ai_model": "",
+  "ai_api_key": null,
   "target_language": "auto",
   "source_language": "auto",
   "game_context": "",
-  "enable_ollama": false,
+  "enable_ai": false,
   "normalize_numbers": true,
   "preload_model": true,
-  "debug_ollama": false,
+  "debug_ai": false,
 
   "settings_hotkey": "F10",
   "first_run_completed": true,
@@ -135,6 +149,8 @@ Config file location:
 }
 ```
 
+> **Upgrading from v0.9.53 or earlier:** Old config fields (`ollama_url`, `enable_ollama`, `model`, `debug_ollama`) are automatically migrated on first load.
+
 ### Translation Options
 
 | Option | Description |
@@ -142,10 +158,12 @@ Config file location:
 | `target_language` | Target language (`"auto"` = system language, or `"French"`, `"German"`, etc.) |
 | `source_language` | Source language (`"auto"` = let AI detect) |
 | `game_context` | Game description for better translations (e.g., `"Medieval fantasy RPG"`) |
-| `enable_ollama` | `true` to enable live AI translation |
-| `model` | Ollama model (`qwen3:8b` recommended, other models are experimental) |
+| `enable_ai` | `true` to enable live AI translation |
+| `ai_url` | URL of your OpenAI-compatible server (e.g., `"http://localhost:11434"`) |
+| `ai_model` | Model name (selected from server's `/v1/models` endpoint) |
+| `ai_api_key` | API key for cloud providers (encrypted at rest, optional for local servers) |
 | `normalize_numbers` | `true` to replace numbers with placeholders for better cache reuse |
-| `debug_ollama` | `true` to log detailed Ollama requests/responses |
+| `debug_ai` | `true` to log detailed AI requests/responses |
 
 ### UI Options
 
@@ -247,7 +265,7 @@ Each translation entry has a **quality tag** indicating how it was created:
 |-----|------|-------------|--------------|
 | **H** | Human | Manually written by a human | 3 points |
 | **V** | Validated | AI translation reviewed and approved by human | 2 points |
-| **A** | AI | Automatically translated by Ollama | 1 point |
+| **A** | AI | Automatically translated by AI | 1 point |
 
 > **Note:** Entries with tag `H` but empty value are displayed as "C" (Capture) in stats and count as 0 points until translated.
 
@@ -277,7 +295,7 @@ Score = (H×3 + V×2 + A×1) / (H + V + A)
 #### How tags are assigned
 
 - **Capture mode**: Text saved with empty value, tag `H` (shows as `C` in stats until translated)
-- **AI translation**: Ollama translates → tag `A`
+- **AI translation**: AI server translates → tag `A`
 - **Manual edit**: User edits a translation in-game or on website → tag `H`
 - **Validation**: User approves AI translation on website → tag `V`
 
@@ -410,10 +428,11 @@ Configuration is centralized in `Directory.Build.props`:
 
 ```xml
 <PropertyGroup>
-  <Version>0.9.43</Version>
+  <Version>0.9.54</Version>
   <!-- Change these URLs to use your own instance (AGPL compliance) -->
   <ApiBaseUrl>https://unitygametranslator.asymptomatikgames.com/api/v1</ApiBaseUrl>
   <WebsiteBaseUrl>https://unitygametranslator.asymptomatikgames.com</WebsiteBaseUrl>
+  <SseBaseUrl>https://sse-unitygametranslator.asymptomatikgames.com</SseBaseUrl>
 </PropertyGroup>
 ```
 
@@ -435,7 +454,7 @@ Configuration is centralized in `Directory.Build.props`:
 ```
 UnityGameTranslator/
 ├── UnityGameTranslator.Core/           # Shared translation engine
-│   ├── TranslatorCore.cs               # Main logic, config, Ollama API
+│   ├── TranslatorCore.cs               # Main logic, config, AI API (OpenAI-compatible)
 │   ├── TranslatorPatches.cs            # Harmony patches for text
 │   ├── TranslatorScanner.cs            # Scene scanning for UI
 │   ├── UI/                             # UniverseLib uGUI overlay system
@@ -481,7 +500,7 @@ UnityGameTranslator is built on the shoulders of amazing open-source projects:
 - **[MelonLoader](https://github.com/LavaGang/MelonLoader)** by LavaGang - Universal Unity mod loader
 - **[Harmony](https://github.com/pardeike/Harmony)** by Andreas Pardeike - Runtime method patching
 - **[Newtonsoft.Json](https://github.com/JamesNK/Newtonsoft.Json)** by James Newton-King - JSON framework
-- **[Ollama](https://ollama.ai/)** - Local AI inference engine
+- **[OpenAI API](https://platform.openai.com/docs/api-reference)** - Standard API format supported by all major AI providers
 
 Special thanks to the Unity modding community for documentation, tutorials, and support.
 
