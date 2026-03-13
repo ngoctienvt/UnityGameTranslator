@@ -1623,11 +1623,7 @@ namespace UnityGameTranslator.Core
                             TranslatorCore.LogWarning($"[AlternateTMP] Could not set material: {matEx.Message}");
                         }
 
-                        // UI is guaranteed to be initialized here (we return early if not)
                         // Force mesh regeneration after font change
-                        bool meshUpdated = false;
-
-                        // Try ForceMeshUpdate first - most reliable
                         try
                         {
                             var forceMeshUpdate = instance.GetType().GetMethod("ForceMeshUpdate",
@@ -1636,8 +1632,6 @@ namespace UnityGameTranslator.Core
                             if (forceMeshUpdate != null)
                             {
                                 forceMeshUpdate.Invoke(instance, null);
-                                TranslatorCore.LogInfo($"[AlternateTMP] Called ForceMeshUpdate");
-                                meshUpdated = true;
                             }
                         }
                         catch (Exception)
