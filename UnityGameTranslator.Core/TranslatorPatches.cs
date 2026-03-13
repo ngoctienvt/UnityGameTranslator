@@ -1592,26 +1592,14 @@ namespace UnityGameTranslator.Core
                         }
 
                         // Replace the font directly
-                        var fontBefore = fontProp.GetValue(instance, null) as UnityEngine.Object;
                         fontProp.SetValue(instance, customFontAsset, null);
-                        var fontAfter = fontProp.GetValue(instance, null) as UnityEngine.Object;
-                        var comp = instance as Component;
-                        string compInfo = comp != null ? $"{comp.GetType().Name} on '{comp.gameObject.name}'" : instance.GetType().Name;
-                        string hierarchy = "";
-                        if (comp != null)
+
+                        if (TranslatorCore.Config.debug_ai)
                         {
-                            var t = comp.transform;
-                            for (int i = 0; i < 4 && t != null; i++)
-                            {
-                                hierarchy += (i > 0 ? " -> " : "") + t.name;
-                                t = t.parent;
-                            }
-                            var canvas = comp.GetComponentInParent<Canvas>();
-                            hierarchy += canvas != null ? $" [Canvas: {canvas.renderMode}]" : " [No Canvas - World Space]";
+                            var comp = instance as Component;
+                            string compInfo = comp != null ? $"{comp.GetType().Name} on '{comp.gameObject.name}'" : instance.GetType().Name;
+                            TranslatorCore.LogInfo($"[AlternateTMP] Applied custom font '{customFontName}' to {compInfo}");
                         }
-                        TranslatorCore.LogInfo($"[AlternateTMP] Applied custom font '{customFontName}' to {compInfo}");
-                        TranslatorCore.LogInfo($"[AlternateTMP] Hierarchy: {hierarchy}");
-                        TranslatorCore.LogInfo($"[AlternateTMP] Font before: {fontBefore?.name ?? "null"}, after: {fontAfter?.name ?? "null"}");
 
                         // Also set the material to match the font's material
                         try
@@ -1626,7 +1614,6 @@ namespace UnityGameTranslator.Core
                                     if (fontSharedMatProp != null && fontSharedMatProp.CanWrite)
                                     {
                                         fontSharedMatProp.SetValue(instance, fontMaterial, null);
-                                        TranslatorCore.LogInfo($"[AlternateTMP] Set fontSharedMaterial to '{fontMaterial.name}'");
                                     }
                                 }
                             }
@@ -1653,111 +1640,16 @@ namespace UnityGameTranslator.Core
                                 meshUpdated = true;
                             }
                         }
-                        catch (Exception fmuEx)
+                        catch (Exception)
                         {
-                            TranslatorCore.LogWarning($"[AlternateTMP] ForceMeshUpdate failed: {fmuEx.InnerException?.Message ?? fmuEx.Message}");
+                            // Expected for components not fully initialized yet.
+                            // The mesh will be regenerated when set_text runs after our prefix completes.
                         }
 
-                        // Note: ForceMeshUpdate may fail for pending components, but that's OK
-                        // The proper mesh update will happen when the original set_text runs
-                        // after our prefix completes with the translated text
-
-                        TranslatorCore.LogInfo($"[AlternateTMP] Custom font type: {customFontAsset.GetType().FullName}");
-
-                        // Log current text content and mesh state
-                        try
+                        // Verbose debug diagnostics (font type, mesh state, glyph checks)
+                        if (TranslatorCore.Config.debug_ai)
                         {
-                            var textPropDbg = instance.GetType().GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
-                            if (textPropDbg != null)
-                            {
-                                var currentText = textPropDbg.GetValue(instance, null) as string ?? "(null)";
-                                TranslatorCore.LogInfo($"[AlternateTMP] Current text content: '{(currentText.Length > 50 ? currentText.Substring(0, 50) + "..." : currentText)}'");
-                            }
-
-                            // Check mesh state
-                            var compMesh = instance as Component;
-                            if (compMesh != null)
-                            {
-                                var meshFilter = compMesh.GetComponent<MeshFilter>();
-                                if (meshFilter != null && meshFilter.sharedMesh != null)
-                                {
-                                    var mesh = meshFilter.sharedMesh;
-                                    TranslatorCore.LogInfo($"[AlternateTMP] Mesh: vertices={mesh.vertexCount}, bounds={mesh.bounds.size}");
-
-                                    // Check first few UVs
-                                    var uvs = mesh.uv;
-                                    if (uvs != null && uvs.Length > 0)
-                                    {
-                                        var uv0 = uvs[0];
-                                        var uv1 = uvs.Length > 1 ? uvs[1] : Vector2.zero;
-                                        var uv2 = uvs.Length > 2 ? uvs[2] : Vector2.zero;
-                                        var uv3 = uvs.Length > 3 ? uvs[3] : Vector2.zero;
-                                        TranslatorCore.LogInfo($"[AlternateTMP] First quad UVs: ({uv0.x:F3},{uv0.y:F3}) ({uv1.x:F3},{uv1.y:F3}) ({uv2.x:F3},{uv2.y:F3}) ({uv3.x:F3},{uv3.y:F3})");
-                                    }
-                                }
-                                else
-                                {
-                                    TranslatorCore.LogWarning($"[AlternateTMP] No mesh found on component!");
-                                }
-
-                                var meshRenderer = compMesh.GetComponent<MeshRenderer>();
-                                if (meshRenderer != null)
-                                {
-                                    var mat = meshRenderer.sharedMaterial;
-                                    var mainTex = mat?.mainTexture;
-                                    TranslatorCore.LogInfo($"[AlternateTMP] Renderer material: {mat?.name ?? "null"}, texture: {mainTex?.name ?? "null"} ({mainTex?.width}x{mainTex?.height}), enabled={meshRenderer.enabled}");
-
-                                    // Check if material has _MainTex
-                                    if (mat != null && mat.HasProperty("_MainTex"))
-                                    {
-                                        var shaderTex = mat.GetTexture("_MainTex");
-                                        TranslatorCore.LogInfo($"[AlternateTMP] Shader _MainTex: {shaderTex?.name ?? "null"} ({shaderTex?.width}x{shaderTex?.height})");
-                                    }
-                                }
-                            }
-                        }
-                        catch { }
-
-                        // Debug: Check if font has glyphs for the text being set
-                        try
-                        {
-                            var dictField = customFontAsset.GetType().GetField("m_characterDictionary", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                            if (dictField != null)
-                            {
-                                var dict = dictField.GetValue(customFontAsset);
-                                if (dict != null)
-                                {
-                                    var countProp = dict.GetType().GetProperty("Count");
-                                    int count = (int)countProp.GetValue(dict);
-                                    TranslatorCore.LogInfo($"[AlternateTMP] Font dictionary has {count} characters");
-
-                                    // Check for specific Devanagari character (U+0928 = à¤¨)
-                                    var containsKey = dict.GetType().GetMethod("ContainsKey");
-                                    if (containsKey != null)
-                                    {
-                                        bool hasDevanagari = (bool)containsKey.Invoke(dict, new object[] { 0x0928 });
-                                        bool hasLatinA = (bool)containsKey.Invoke(dict, new object[] { 0x0041 });
-                                        TranslatorCore.LogInfo($"[AlternateTMP] Has 'à¤¨' (U+0928): {hasDevanagari}, Has 'A' (U+0041): {hasLatinA}");
-                                    }
-                                }
-                            }
-
-                            // Check glyph list
-                            var glyphListField = customFontAsset.GetType().GetField("m_glyphInfoList", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                            if (glyphListField != null)
-                            {
-                                var glyphList = glyphListField.GetValue(customFontAsset);
-                                if (glyphList != null)
-                                {
-                                    var glyphCountProp = glyphList.GetType().GetProperty("Count");
-                                    int glyphCount = (int)glyphCountProp.GetValue(glyphList);
-                                    TranslatorCore.LogInfo($"[AlternateTMP] Font glyph list has {glyphCount} glyphs");
-                                }
-                            }
-                        }
-                        catch (Exception debugEx)
-                        {
-                            TranslatorCore.LogWarning($"[AlternateTMP] Debug check failed: {debugEx.Message}");
+                            LogFontDebugDiagnostics(instance, customFontAsset, customFontName);
                         }
                         return;
                     }
@@ -1915,14 +1807,11 @@ namespace UnityGameTranslator.Core
                     try
                     {
                         forceMeshUpdate.Invoke(instance, null);
-                        TranslatorCore.LogInfo("[AlternateTMP] Called ForceMeshUpdate()");
                         meshUpdateCalled = true;
                     }
-                    catch (Exception fmuEx)
+                    catch (Exception)
                     {
-                        // Log inner exception for debugging
-                        var inner = fmuEx.InnerException ?? fmuEx;
-                        TranslatorCore.LogWarning($"[AlternateTMP] ForceMeshUpdate() exception: {inner.GetType().Name}: {inner.Message}");
+                        // Expected for components not fully initialized yet
                     }
                 }
 
@@ -1935,33 +1824,21 @@ namespace UnityGameTranslator.Core
                         try
                         {
                             forceMeshUpdate.Invoke(instance, new object[] { true });
-                            TranslatorCore.LogInfo("[AlternateTMP] Called ForceMeshUpdate(true)");
                             meshUpdateCalled = true;
                         }
-                        catch (Exception fmuEx)
+                        catch (Exception)
                         {
-                            var inner = fmuEx.InnerException ?? fmuEx;
-                            TranslatorCore.LogWarning($"[AlternateTMP] ForceMeshUpdate(bool) exception: {inner.GetType().Name}: {inner.Message}");
+                            // Expected for components not fully initialized yet
                         }
                     }
                 }
 
-                if (meshUpdateCalled)
-                {
-                    TranslatorCore.LogInfo("[AlternateTMP] Mesh update successful");
-                    return;
-                }
+                if (meshUpdateCalled) return;
 
                 // ForceMeshUpdate failed - schedule a retry for later when component is ready
-                // SetAllDirty alone doesn't regenerate the mesh, we need ForceMeshUpdate
                 if (retryCount < 5)
                 {
-                    TranslatorCore.LogInfo($"[AlternateTMP] ForceMeshUpdate failed, scheduling retry {retryCount + 1}/5");
                     ScheduleDelayedMeshUpdate(instance, type, retryCount + 1);
-                }
-                else
-                {
-                    TranslatorCore.LogWarning("[AlternateTMP] ForceMeshUpdate failed after 5 retries");
                 }
             }
             catch (Exception ex)
@@ -1992,6 +1869,82 @@ namespace UnityGameTranslator.Core
 
         // Cache for original font sizes to avoid compounding scale
         private static Dictionary<string, float> _alternateTMPOriginalSizes = new Dictionary<string, float>();
+
+        /// <summary>
+        /// Log detailed font diagnostic information (mesh state, glyph checks, etc.)
+        /// Only called when debug_ai is enabled.
+        /// </summary>
+        private static void LogFontDebugDiagnostics(object instance, object customFontAsset, string customFontName)
+        {
+            try
+            {
+                TranslatorCore.LogInfo($"[AlternateTMP] Custom font type: {customFontAsset.GetType().FullName}");
+
+                var textPropDbg = instance.GetType().GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
+                if (textPropDbg != null)
+                {
+                    var currentText = textPropDbg.GetValue(instance, null) as string ?? "(null)";
+                    TranslatorCore.LogInfo($"[AlternateTMP] Current text content: '{(currentText.Length > 50 ? currentText.Substring(0, 50) + "..." : currentText)}'");
+                }
+
+                var compMesh = instance as Component;
+                if (compMesh != null)
+                {
+                    var meshFilter = compMesh.GetComponent<MeshFilter>();
+                    if (meshFilter != null && meshFilter.sharedMesh != null)
+                    {
+                        var mesh = meshFilter.sharedMesh;
+                        TranslatorCore.LogInfo($"[AlternateTMP] Mesh: vertices={mesh.vertexCount}, bounds={mesh.bounds.size}");
+                        var uvs = mesh.uv;
+                        if (uvs != null && uvs.Length >= 4)
+                        {
+                            TranslatorCore.LogInfo($"[AlternateTMP] First quad UVs: ({uvs[0].x:F3},{uvs[0].y:F3}) ({uvs[1].x:F3},{uvs[1].y:F3}) ({uvs[2].x:F3},{uvs[2].y:F3}) ({uvs[3].x:F3},{uvs[3].y:F3})");
+                        }
+                    }
+                    else
+                    {
+                        TranslatorCore.LogInfo($"[AlternateTMP] No mesh found on component (normal for pending components)");
+                    }
+
+                    var meshRenderer = compMesh.GetComponent<MeshRenderer>();
+                    if (meshRenderer != null)
+                    {
+                        var mat = meshRenderer.sharedMaterial;
+                        var mainTex = mat?.mainTexture;
+                        TranslatorCore.LogInfo($"[AlternateTMP] Renderer material: {mat?.name ?? "null"}, texture: {mainTex?.name ?? "null"} ({mainTex?.width}x{mainTex?.height}), enabled={meshRenderer.enabled}");
+                    }
+                }
+
+                // Check glyph dictionary
+                var dictField = customFontAsset.GetType().GetField("m_characterDictionary", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (dictField != null)
+                {
+                    var dict = dictField.GetValue(customFontAsset);
+                    if (dict != null)
+                    {
+                        var countProp = dict.GetType().GetProperty("Count");
+                        int count = (int)countProp.GetValue(dict);
+                        TranslatorCore.LogInfo($"[AlternateTMP] Font dictionary has {count} characters");
+                    }
+                }
+
+                var glyphListField = customFontAsset.GetType().GetField("m_glyphInfoList", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (glyphListField != null)
+                {
+                    var glyphList = glyphListField.GetValue(customFontAsset);
+                    if (glyphList != null)
+                    {
+                        var glyphCountProp = glyphList.GetType().GetProperty("Count");
+                        int glyphCount = (int)glyphCountProp.GetValue(glyphList);
+                        TranslatorCore.LogInfo($"[AlternateTMP] Font glyph list has {glyphCount} glyphs");
+                    }
+                }
+            }
+            catch (Exception debugEx)
+            {
+                TranslatorCore.LogWarning($"[AlternateTMP] Debug check failed: {debugEx.Message}");
+            }
+        }
 
         /// <summary>
         /// Search for all loaded TMP font assets of the alternate type.

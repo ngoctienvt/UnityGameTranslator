@@ -1790,7 +1790,6 @@ namespace UnityGameTranslator.Core.UI.Panels
             if (_disableEventSystemOverrideToggle.isOn != _initialSnapshot.disable_eventsystem_override) count++;
 
             // Fonts - count fonts that differ from initial
-            TranslatorCore.LogInfo($"[OptionsPanel] CountPendingChanges: _pendingFontSettings.Count={_pendingFontSettings.Count}, _initialFontSettings.Count={_initialFontSettings.Count}");
             foreach (var kvp in _pendingFontSettings)
             {
                 if (_initialFontSettings.TryGetValue(kvp.Key, out var initial))

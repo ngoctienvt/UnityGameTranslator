@@ -696,7 +696,12 @@ namespace UnityGameTranslator.Core
                     }
                 }
 
-                Adapter.LogInfo($"Loaded config file (enable_translations={Config.enable_translations})");
+                if (Config._configMigrated)
+                {
+                    Adapter.LogInfo($"[Config] Migrated old Ollama config -> AI config (enable_ai={Config.enable_ai}, ai_url={Config.ai_url}, ai_model={Config.ai_model})");
+                    SaveConfig(); // Persist migrated config with new field names
+                }
+                Adapter.LogInfo($"Loaded config (enable_translations={Config.enable_translations}, enable_ai={Config.enable_ai}, ai_url={Config.ai_url}, ai_model={Config.ai_model})");
             }
             catch (Exception e)
             {
@@ -1369,10 +1374,15 @@ namespace UnityGameTranslator.Core
 
         private static void StartTranslationWorker()
         {
-            if (!Config.enable_ai) return;
+            if (!Config.enable_ai)
+            {
+                Adapter?.LogWarning("[Worker] Cannot start: enable_ai is false");
+                return;
+            }
             if (workerRunning) return; // Already running
 
             workerRunning = true;
+            Adapter?.LogInfo("[Worker] Starting translation worker thread");
             Thread workerThread = new Thread(TranslationWorkerLoop);
             workerThread.IsBackground = true;
             workerThread.Start();
@@ -1476,8 +1486,9 @@ namespace UnityGameTranslator.Core
                 var response = await httpClient.SendAsync(request);
                 return response.IsSuccessStatusCode;
             }
-            catch
+            catch (Exception e)
             {
+                Adapter?.LogWarning($"[AI] Connection test failed: {e.Message}");
                 return false;
             }
         }
@@ -1526,8 +1537,7 @@ namespace UnityGameTranslator.Core
 
         private static void TranslationWorkerLoop()
         {
-            if (Config.debug_ai)
-                Adapter?.LogInfo("[Worker] Thread started");
+            Adapter?.LogInfo("[Worker] Thread started, waiting for translations...");
 
             while (true)
             {
@@ -1573,6 +1583,11 @@ namespace UnityGameTranslator.Core
                 if (textToTranslate != null)
                 {
                     string originalText = textToTranslate;
+                    if (Config.debug_ai)
+                    {
+                        string workerPreview = textToTranslate.Length > 40 ? textToTranslate.Substring(0, 40) + "..." : textToTranslate;
+                        Adapter?.LogInfo($"[Worker] Processing: {workerPreview} (queue remaining: {translationQueue.Count})");
+                    }
                     isTranslating = true;
                     currentlyTranslating = textToTranslate.Length > 50 ? textToTranslate.Substring(0, 50) + "..." : textToTranslate;
 
@@ -1628,9 +1643,8 @@ namespace UnityGameTranslator.Core
                         else if (translation == null)
                         {
                             translation = TranslateWithAI(normalizedOriginal, extractedNumbers, isOwnUI);
-
                             if (Config.debug_ai)
-                                Adapter?.LogInfo($"[Worker] AI returned: {translation?.Substring(0, Math.Min(30, translation?.Length ?? 0))}...");
+                                Adapter?.LogInfo($"[Worker] AI returned: {(translation == null ? "(null)" : translation.Substring(0, Math.Min(40, translation.Length)))}");
 
                             if (!string.IsNullOrEmpty(translation))
                             {
@@ -1671,8 +1685,7 @@ namespace UnityGameTranslator.Core
                     }
                     catch (Exception e)
                     {
-                        if (Config.debug_ai)
-                            Adapter?.LogWarning($"AI error: {e.Message}");
+                        Adapter?.LogWarning($"[AI] Worker error: {e.Message}");
                     }
                     finally
                     {
@@ -1724,6 +1737,18 @@ namespace UnityGameTranslator.Core
                 if (!text.Contains(' ')) return TextType.SingleWord;
                 return TextType.Phrase;
             }
+        }
+
+        /// <summary>
+        /// Detect if a model is a "thinking" model that needs special handling
+        /// to disable the reasoning phase (e.g., /no_think, assistant prefill).
+        /// </summary>
+        private static bool IsThinkingModel(string modelName)
+        {
+            if (string.IsNullOrEmpty(modelName)) return false;
+            string lower = modelName.ToLowerInvariant();
+            // Known thinking model families
+            return lower.StartsWith("qwen3") || lower.Contains("deepseek-r1") || lower.Contains("deepseek-r2");
         }
 
         private static string TranslateWithAI(string textWithPlaceholders, List<string> extractedNumbers, bool isOwnUI = false)
@@ -1823,20 +1848,34 @@ namespace UnityGameTranslator.Core
                     Adapter?.LogInfo($"[AI] System prompt:\n{systemPrompt}");
                 }
 
-                var requestBody = new
+                // Build messages list
+                bool isThinkingModel = IsThinkingModel(Config.ai_model);
+                string userContent = isThinkingModel ? textToTranslate + " /no_think" : textToTranslate;
+
+                var messagesArray = new JArray
                 {
-                    model = Config.ai_model,
-                    messages = new object[]
-                    {
-                        new { role = "system", content = systemPrompt },
-                        new { role = "user", content = textToTranslate }
-                    },
-                    temperature = 0.0,
-                    max_tokens = Math.Max(200, textToTranslate.Length * 2),
-                    stream = false
+                    new JObject { ["role"] = "system", ["content"] = systemPrompt },
+                    new JObject { ["role"] = "user", ["content"] = userContent }
+                };
+                // Extra safety for known thinking models: assistant prefill to skip reasoning
+                if (isThinkingModel)
+                {
+                    messagesArray.Add(new JObject { ["role"] = "assistant", ["content"] = "<think>\n\n</think>\n\n" });
+                }
+
+                var requestObj = new JObject
+                {
+                    ["model"] = Config.ai_model,
+                    ["messages"] = messagesArray,
+                    ["temperature"] = 0.0,
+                    ["max_tokens"] = Math.Max(200, textToTranslate.Length * 2),
+                    ["stream"] = false,
+                    // Universal: disable thinking for any model that supports it
+                    // Non-thinking models ignore this field
+                    ["think"] = false
                 };
 
-                string jsonRequest = JsonConvert.SerializeObject(requestBody);
+                string jsonRequest = requestObj.ToString(Newtonsoft.Json.Formatting.None);
                 var httpContent = new StringContent(jsonRequest, Encoding.UTF8, "application/json");
 
                 var request = new HttpRequestMessage(HttpMethod.Post, $"{Config.ai_url.TrimEnd('/')}/v1/chat/completions");
@@ -1847,8 +1886,9 @@ namespace UnityGameTranslator.Core
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    if (Config.debug_ai)
-                        Adapter?.LogWarning($"AI HTTP {response.StatusCode}");
+                    string errorBody = "";
+                    try { errorBody = response.Content.ReadAsStringAsync().Result; } catch { }
+                    Adapter?.LogWarning($"[AI] HTTP {(int)response.StatusCode} {response.StatusCode}: {errorBody}");
                     return null;
                 }
 
@@ -1874,8 +1914,7 @@ namespace UnityGameTranslator.Core
             }
             catch (Exception e)
             {
-                if (Config.debug_ai)
-                    Adapter?.LogWarning($"AI exception: {e.Message}");
+                Adapter?.LogWarning($"[AI] Translation error: {e.Message}");
                 return null;
             }
         }
@@ -2095,10 +2134,12 @@ namespace UnityGameTranslator.Core
                 pendingTranslations.Add(text);
                 translationQueue.Enqueue(text);
 
-                if (Config.debug_ai)
+                // Log first queued item always, then every 10th
+                int queueSize = translationQueue.Count;
+                if (queueSize == 1 || queueSize % 10 == 0 || Config.debug_ai)
                 {
                     string preview = text.Length > 40 ? text.Substring(0, 40) + "..." : text;
-                    Adapter?.LogInfo($"[Queue] {preview}{(isOwnUI ? " (UI)" : "")}");
+                    Adapter?.LogInfo($"[Queue] #{queueSize}: {preview}{(isOwnUI ? " (UI)" : "")}");
                 }
             }
         }
@@ -2667,16 +2708,37 @@ namespace UnityGameTranslator.Core
         private void OnDeserialized(System.Runtime.Serialization.StreamingContext context)
         {
             if (_extraData == null) return;
+            bool migrated = false;
             if (_extraData.TryGetValue("ollama_url", out var url))
+            {
                 ai_url = url.ToString();
+                migrated = true;
+            }
             if (_extraData.TryGetValue("enable_ollama", out var eo))
+            {
                 enable_ai = eo.Value<bool>();
+                migrated = true;
+            }
             if (_extraData.TryGetValue("debug_ollama", out var dbg))
+            {
                 debug_ai = dbg.Value<bool>();
+                migrated = true;
+            }
             if (_extraData.TryGetValue("model", out var m) && string.IsNullOrEmpty(ai_model))
+            {
                 ai_model = m.ToString();
+                migrated = true;
+            }
+            if (migrated)
+            {
+                // Log will be visible once Adapter is set - store flag for post-load log
+                _configMigrated = true;
+            }
             _extraData = null;
         }
+
+        [JsonIgnore]
+        internal bool _configMigrated = false;
 
         // General settings
         public bool capture_keys_only { get; set; } = false;
