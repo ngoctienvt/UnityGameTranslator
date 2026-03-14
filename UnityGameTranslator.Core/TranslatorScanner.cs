@@ -454,13 +454,19 @@ namespace UnityGameTranslator.Core
 
             try
             {
+                // Match both original font AND any replacement that was applied
+                var fontNamesToMatch = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { fontName };
+                string fallback = FontManager.GetConfiguredFallback(fontName);
+                if (!string.IsNullOrEmpty(fallback))
+                    fontNamesToMatch.Add(fallback);
+
                 // Restore Mono components with this font (TMP + UI.Text)
-                restored += RestoreOriginalsForFontInCache(cachedTMPMono, fontName);
-                restored += RestoreOriginalsForFontInCache(cachedUIMono, fontName);
+                restored += RestoreOriginalsForFontInCache(cachedTMPMono, fontNamesToMatch);
+                restored += RestoreOriginalsForFontInCache(cachedUIMono, fontNamesToMatch);
 
                 // IL2CPP components
-                restored += RestoreOriginalsForFontIL2CPP(cachedTMPComponents, tryCastTMPMethod, fontName);
-                restored += RestoreOriginalsForFontIL2CPP(cachedUIComponents, tryCastTextMethod, fontName);
+                restored += RestoreOriginalsForFontIL2CPP(cachedTMPComponents, tryCastTMPMethod, fontNamesToMatch);
+                restored += RestoreOriginalsForFontIL2CPP(cachedUIComponents, tryCastTextMethod, fontNamesToMatch);
 
                 if (restored > 0)
                     TranslatorCore.LogInfo($"[Scanner] Restored {restored} originals for font: {fontName}");
@@ -485,16 +491,24 @@ namespace UnityGameTranslator.Core
                 // Force cache refresh to capture all current components
                 ForceRefreshCache();
 
+                // Build set of font names to match: the original font AND any replacement
+                // that may have already been applied (so we can re-process those components too)
+                var fontNamesToMatch = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { fontName };
+                string fallback = FontManager.GetConfiguredFallback(fontName);
+                if (!string.IsNullOrEmpty(fallback))
+                    fontNamesToMatch.Add(fallback);
+
+                TranslatorCore.LogInfo($"[Scanner] RefreshForFont: matching fonts [{string.Join(", ", fontNamesToMatch)}], caches: TMP={cachedTMPMono?.Length ?? 0}, UI={cachedUIMono?.Length ?? 0}");
+
                 // Refresh Mono components (TMP + UI.Text)
-                refreshed += RefreshForFontInCache(cachedTMPMono, fontName);
-                refreshed += RefreshForFontInCache(cachedUIMono, fontName);
+                refreshed += RefreshForFontInCache(cachedTMPMono, fontNamesToMatch);
+                refreshed += RefreshForFontInCache(cachedUIMono, fontNamesToMatch);
 
                 // IL2CPP components
-                refreshed += RefreshForFontIL2CPP(cachedTMPComponents, tryCastTMPMethod, fontName);
-                refreshed += RefreshForFontIL2CPP(cachedUIComponents, tryCastTextMethod, fontName);
+                refreshed += RefreshForFontIL2CPP(cachedTMPComponents, tryCastTMPMethod, fontNamesToMatch);
+                refreshed += RefreshForFontIL2CPP(cachedUIComponents, tryCastTextMethod, fontNamesToMatch);
 
-                if (refreshed > 0)
-                    TranslatorCore.LogInfo($"[Scanner] Refreshed {refreshed} components for font: {fontName}");
+                TranslatorCore.LogInfo($"[Scanner] Refreshed {refreshed} components for font: {fontName}");
             }
             catch (Exception ex)
             {
@@ -505,7 +519,7 @@ namespace UnityGameTranslator.Core
         /// <summary>
         /// Restore originals for a given font in a Mono component cache.
         /// </summary>
-        private static int RestoreOriginalsForFontInCache(UnityEngine.Object[] cache, string fontName)
+        private static int RestoreOriginalsForFontInCache(UnityEngine.Object[] cache, HashSet<string> fontNames)
         {
             if (cache == null) return 0;
             int restored = 0;
@@ -516,7 +530,7 @@ namespace UnityGameTranslator.Core
                 try
                 {
                     string compFont = TypeHelper.GetFontName(obj);
-                    if (compFont != fontName) continue;
+                    if (string.IsNullOrEmpty(compFont) || !fontNames.Contains(compFont)) continue;
 
                     int id = obj.GetInstanceID();
                     string original = GetOriginalText(id);
@@ -536,7 +550,7 @@ namespace UnityGameTranslator.Core
         /// <summary>
         /// Restore originals for a given font in an IL2CPP component cache.
         /// </summary>
-        private static int RestoreOriginalsForFontIL2CPP(UnityEngine.Object[] cache, MethodInfo tryCastMethod, string fontName)
+        private static int RestoreOriginalsForFontIL2CPP(UnityEngine.Object[] cache, MethodInfo tryCastMethod, HashSet<string> fontNames)
         {
             if (cache == null || tryCastMethod == null) return 0;
             int restored = 0;
@@ -552,7 +566,7 @@ namespace UnityGameTranslator.Core
                     if (component == null) continue;
 
                     string compFont = TypeHelper.GetFontName(component);
-                    if (compFont != fontName) continue;
+                    if (string.IsNullOrEmpty(compFont) || !fontNames.Contains(compFont)) continue;
 
                     int id = TypeHelper.GetInstanceID(component);
                     if (id == -1) continue;
@@ -571,9 +585,9 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Refresh components for a given font in a Mono cache.
+        /// Refresh components for matching fonts in a Mono cache.
         /// </summary>
-        private static int RefreshForFontInCache(UnityEngine.Object[] cache, string fontName)
+        private static int RefreshForFontInCache(UnityEngine.Object[] cache, HashSet<string> fontNames)
         {
             if (cache == null) return 0;
             int refreshed = 0;
@@ -584,7 +598,7 @@ namespace UnityGameTranslator.Core
                 try
                 {
                     string compFont = TypeHelper.GetFontName(obj);
-                    if (compFont != fontName) continue;
+                    if (string.IsNullOrEmpty(compFont) || !fontNames.Contains(compFont)) continue;
 
                     int id = obj.GetInstanceID();
                     processedTextHashes.Remove(id);
@@ -602,9 +616,9 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Refresh components for a given font in an IL2CPP cache.
+        /// Refresh components for matching fonts in an IL2CPP cache.
         /// </summary>
-        private static int RefreshForFontIL2CPP(UnityEngine.Object[] cache, MethodInfo tryCastMethod, string fontName)
+        private static int RefreshForFontIL2CPP(UnityEngine.Object[] cache, MethodInfo tryCastMethod, HashSet<string> fontNames)
         {
             if (cache == null || tryCastMethod == null) return 0;
             int refreshed = 0;
@@ -620,7 +634,7 @@ namespace UnityGameTranslator.Core
                     if (component == null) continue;
 
                     string compFont = TypeHelper.GetFontName(component);
-                    if (compFont != fontName) continue;
+                    if (string.IsNullOrEmpty(compFont) || !fontNames.Contains(compFont)) continue;
 
                     int id = TypeHelper.GetInstanceID(component);
                     if (id == -1) continue;

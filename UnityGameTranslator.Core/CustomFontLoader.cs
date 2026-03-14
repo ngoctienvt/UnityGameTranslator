@@ -561,61 +561,100 @@ namespace UnityGameTranslator.Core
         {
             try
             {
-                // Skip our own custom fonts
-                if (existingFont.name == "NotoSansDevanagari" || existingFont.name == "KrutiDev714Normal")
-                    return;
-
-                TranslatorCore.LogInfo($"[CustomFontLoader] === Dumping existing font: {existingFont.name} ===");
+                TranslatorCore.LogInfo($"[CustomFontLoader] === Dumping font structure: {existingFont.name} ===");
 
                 var type = existingFont.GetType();
+                TranslatorCore.LogInfo($"[CustomFontLoader] Type: {type.FullName}");
 
                 // List all fields
                 var allFields = type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                TranslatorCore.LogInfo($"[CustomFontLoader] All fields: {string.Join(", ", allFields.Select(f => f.Name))}");
+                TranslatorCore.LogInfo($"[CustomFontLoader] Fields ({allFields.Length}): {string.Join(", ", allFields.Select(f => f.Name))}");
 
-                // Find any field containing "glyph" (case insensitive)
-                foreach (var field in allFields)
+                // List ALL properties — this is what IL2CPP exposes instead of fields
+                var allProps = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+                var propNames = new List<string>();
+                foreach (var prop in allProps)
                 {
-                    if (field.Name.ToLower().Contains("glyph") || field.Name.ToLower().Contains("character"))
+                    string info = prop.Name;
+                    try
                     {
-                        var value = field.GetValue(existingFont);
-                        if (value != null)
+                        var val = prop.GetValue(existingFont, null);
+                        if (val != null)
                         {
-                            var valType = value.GetType();
-                            if (valType.IsGenericType && valType.GetGenericTypeDefinition() == typeof(List<>))
-                            {
-                                var countProp = valType.GetProperty("Count");
-                                int count = (int)countProp.GetValue(value);
-                                TranslatorCore.LogInfo($"[CustomFontLoader] {field.Name}: List with {count} items");
+                            var valType = val.GetType();
+                            if (val is string s)
+                                info += $"=\"{(s.Length > 30 ? s.Substring(0, 30) + "..." : s)}\"";
+                            else if (val is int || val is float || val is bool)
+                                info += $"={val}";
+                            else
+                                info += $":{valType.Name}";
+                        }
+                        else
+                        {
+                            info += "=null";
+                        }
+                    }
+                    catch
+                    {
+                        info += "=(error)";
+                    }
+                    propNames.Add(info);
+                }
+                TranslatorCore.LogInfo($"[CustomFontLoader] Properties ({allProps.Length}): {string.Join(", ", propNames)}");
 
-                                // Dump first few items
-                                if (count > 0)
+                // Dump properties related to glyphs, characters, atlas, material
+                foreach (var prop in allProps)
+                {
+                    string lowerName = prop.Name.ToLower();
+                    if (lowerName.Contains("glyph") || lowerName.Contains("character") ||
+                        lowerName.Contains("atlas") || lowerName.Contains("material") ||
+                        lowerName.Contains("face") || lowerName.Contains("font"))
+                    {
+                        try
+                        {
+                            var value = prop.GetValue(existingFont, null);
+                            if (value != null)
+                            {
+                                var valType = value.GetType();
+                                // Check for collection types
+                                var countProp = valType.GetProperty("Count");
+                                if (countProp != null)
                                 {
-                                    var indexer = valType.GetProperty("Item");
-                                    for (int i = 0; i < Math.Min(2, count); i++)
+                                    int count = (int)countProp.GetValue(value, null);
+                                    TranslatorCore.LogInfo($"[CustomFontLoader] PROP {prop.Name}: {valType.Name} Count={count}");
+
+                                    // Dump first item structure
+                                    if (count > 0)
                                     {
-                                        var item = indexer.GetValue(value, new object[] { i });
-                                        if (item != null)
+                                        var indexer = valType.GetProperty("Item");
+                                        if (indexer != null)
                                         {
-                                            var itemType = item.GetType();
-                                            var itemFields = itemType.GetFields(BindingFlags.Public | BindingFlags.Instance);
-                                            var fieldValues = itemFields.Select(f => $"{f.Name}={f.GetValue(item)}");
-                                            TranslatorCore.LogInfo($"[CustomFontLoader]   [{i}]: {string.Join(", ", fieldValues)}");
+                                            var firstItem = indexer.GetValue(value, new object[] { 0 });
+                                            if (firstItem != null)
+                                            {
+                                                var itemProps = firstItem.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance);
+                                                var itemInfo = new List<string>();
+                                                foreach (var ip in itemProps)
+                                                {
+                                                    try
+                                                    {
+                                                        var iv = ip.GetValue(firstItem, null);
+                                                        itemInfo.Add($"{ip.Name}={iv}");
+                                                    }
+                                                    catch { itemInfo.Add($"{ip.Name}=(err)"); }
+                                                }
+                                                TranslatorCore.LogInfo($"[CustomFontLoader]   [0] props: {string.Join(", ", itemInfo)}");
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            else if (valType.IsGenericType && valType.GetGenericTypeDefinition() == typeof(Dictionary<,>))
-                            {
-                                var countProp = valType.GetProperty("Count");
-                                int count = (int)countProp.GetValue(value);
-                                TranslatorCore.LogInfo($"[CustomFontLoader] {field.Name}: Dictionary with {count} items");
-                            }
-                            else
-                            {
-                                TranslatorCore.LogInfo($"[CustomFontLoader] {field.Name}: {valType.Name}");
+                                else
+                                {
+                                    TranslatorCore.LogInfo($"[CustomFontLoader] PROP {prop.Name}: {valType.Name} = {value}");
+                                }
                             }
                         }
+                        catch { }
                     }
                 }
 
