@@ -237,14 +237,16 @@ namespace UnityGameTranslator.Core
                 // Debug: Check if texture has actual content (not all white/transparent)
                 try
                 {
-                    var pixels = texture.GetPixels(0, 0, Math.Min(10, texture.width), Math.Min(10, texture.height));
+                    var pixels32 = texture.GetPixels32();
+                    int sampleSize = Math.Min(100, pixels32.Length);
                     int nonWhiteCount = 0;
-                    foreach (var p in pixels)
+                    for (int pi = 0; pi < sampleSize; pi++)
                     {
-                        if (p.r < 0.99f || p.g < 0.99f || p.b < 0.99f || p.a < 0.99f)
+                        var p = pixels32[pi];
+                        if (p.r < 252 || p.g < 252 || p.b < 252 || p.a < 252)
                             nonWhiteCount++;
                     }
-                    TranslatorCore.LogInfo($"[CustomFontLoader] Texture sample: {nonWhiteCount}/{pixels.Length} non-white pixels in corner");
+                    TranslatorCore.LogInfo($"[CustomFontLoader] Texture sample: {nonWhiteCount}/{sampleSize} non-white pixels in corner");
                 }
                 catch (Exception ex)
                 {
@@ -993,20 +995,22 @@ namespace UnityGameTranslator.Core
 
             try
             {
-                var pixels = texture.GetPixels();
+                // Use GetPixels32/SetPixels32 for IL2CPP compatibility
+                // (GetPixels with float Color[] is not available on all IL2CPP builds)
+                var pixels = texture.GetPixels32();
                 bool needsConversion = false;
 
-                // Check if we need conversion: if alpha is mostly 1.0 but R varies, we need to copy R to A
+                // Check if we need conversion: if alpha is mostly 255 but R varies, we need to copy R to A
                 int sampleCount = Math.Min(100, pixels.Length);
                 int alphaOnes = 0;
                 int rVariation = 0;
-                float lastR = -1;
+                int lastR = -1;
 
                 for (int i = 0; i < sampleCount; i++)
                 {
                     int idx = i * (pixels.Length / sampleCount);
-                    if (pixels[idx].a > 0.99f) alphaOnes++;
-                    if (lastR >= 0 && Math.Abs(pixels[idx].r - lastR) > 0.01f) rVariation++;
+                    if (pixels[idx].a > 252) alphaOnes++;
+                    if (lastR >= 0 && Math.Abs(pixels[idx].r - lastR) > 2) rVariation++;
                     lastR = pixels[idx].r;
                 }
 
@@ -1019,9 +1023,9 @@ namespace UnityGameTranslator.Core
                     for (int i = 0; i < pixels.Length; i++)
                     {
                         // Copy R channel to Alpha, keep RGB as white for proper rendering
-                        pixels[i] = new Color(1f, 1f, 1f, pixels[i].r);
+                        pixels[i] = new Color32(255, 255, 255, pixels[i].r);
                     }
-                    texture.SetPixels(pixels);
+                    texture.SetPixels32(pixels);
                     texture.Apply();
                     TranslatorCore.LogInfo("[CustomFontLoader] SDF texture conversion complete");
                 }

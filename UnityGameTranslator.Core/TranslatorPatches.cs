@@ -42,6 +42,9 @@ namespace UnityGameTranslator.Core
         {
             int patchCount = 0;
 
+            // On IL2CPP, TMP assemblies may be loaded after initial TypeHelper.Initialize()
+            TypeHelper.TryResolveIfNeeded();
+
             try
             {
                 // TMP_Text.text setter (resolved via TypeHelper to avoid IL2CPP TypeLoadException)

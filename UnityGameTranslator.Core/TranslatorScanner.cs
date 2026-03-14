@@ -671,6 +671,9 @@ namespace UnityGameTranslator.Core
             if (il2cppMethodsInitialized) return;
             il2cppMethodsInitialized = true;
 
+            // On IL2CPP, TMP assemblies may be loaded after initial TypeHelper.Initialize()
+            TypeHelper.TryResolveIfNeeded();
+
             try
             {
                 // Find Il2CppType.Of<T>()

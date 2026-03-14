@@ -93,20 +93,55 @@ namespace UnityGameTranslator.Core
             }
         }
 
+        /// <summary>
+        /// Re-attempt type resolution for types that weren't found on first pass.
+        /// On IL2CPP, assemblies may be loaded lazily after initial init.
+        /// Call this before patches or scanning if TMP types are still null.
+        /// </summary>
+        public static void TryResolveIfNeeded()
+        {
+            if (TMP_TextType != null) return; // Already resolved
+
+            try
+            {
+                TranslatorCore.LogInfo("[TypeHelper] Re-attempting TMP type resolution (late-loaded assemblies)...");
+                ResolveTypes();
+                if (TMP_TextType != null)
+                {
+                    ResolveProperties();
+                    LogResults();
+                }
+                else
+                {
+                    TranslatorCore.LogWarning("[TypeHelper] TMP types still not found after re-scan");
+                }
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogError($"[TypeHelper] Re-resolve error: {ex.Message}");
+            }
+        }
+
         private static void ResolveTypes()
         {
             // UI.Text and InputField - standard Unity types
-            UI_TextType = FindType("UnityEngine.UI.Text");
-            UI_InputFieldType = FindType("UnityEngine.UI.InputField");
+            if (UI_TextType == null)
+                UI_TextType = FindType("UnityEngine.UI.Text");
+            if (UI_InputFieldType == null)
+                UI_InputFieldType = FindType("UnityEngine.UI.InputField");
 
             // TextMesh - legacy 3D text
-            TextMeshType = typeof(TextMesh);
+            if (TextMeshType == null)
+                TextMeshType = typeof(TextMesh);
 
             // Font
-            FontType = typeof(Font);
+            if (FontType == null)
+                FontType = typeof(Font);
 
-            // TMP types - prefer TMProOld (alternate TMP), fallback to TMPro
-            // Same priority logic as CustomFontLoader.InitializeTypes()
+            // TMP types - already resolved?
+            if (TMP_TextType != null) return;
+
+            // Prefer TMProOld (alternate TMP), fallback to TMPro
             Type tmpOldText = FindType("TMProOld.TMP_Text");
             Type tmpOldFontAsset = FindType("TMProOld.TMP_FontAsset");
             Type tmpOldInputField = FindType("TMProOld.TMP_InputField");
@@ -118,14 +153,57 @@ namespace UnityGameTranslator.Core
                 TMP_InputFieldType = tmpOldInputField;
                 UseAlternateTMP = true;
                 TranslatorCore.LogInfo("[TypeHelper] Using TMProOld types");
+                return;
             }
-            else
+
+            // Standard TMPro namespace
+            TMP_TextType = FindType("TMPro.TMP_Text");
+            if (TMP_TextType != null)
             {
-                TMP_TextType = FindType("TMPro.TMP_Text");
                 TMP_FontAssetType = FindType("TMPro.TMP_FontAsset");
                 TMP_InputFieldType = FindType("TMPro.TMP_InputField");
                 UseAlternateTMP = false;
+                return;
             }
+
+            // IL2CPP: types may be in Il2Cpp-prefixed assemblies but keep their original namespace.
+            // Or they may have Il2Cpp-prefixed type names. Try common IL2CPP patterns.
+            // On MelonLoader IL2CPP, the type might be in assembly "Il2CppTMPro" but namespace is still "TMPro"
+            // FindType already scans all assemblies, so if the namespace is "TMPro" it would have been found above.
+            // The issue is the assemblies may not be loaded yet at init time.
+            // Log all loaded assemblies containing "TMP" for diagnostics.
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    string asmName = asm.GetName().Name;
+                    if (asmName.IndexOf("TMP", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        asmName.IndexOf("TextMesh", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        TranslatorCore.LogInfo($"[TypeHelper] Found TMP-related assembly: {asmName}");
+                        // Try to find TMP_Text in this assembly
+                        foreach (var type in asm.GetTypes())
+                        {
+                            if (type.Name == "TMP_Text" && TMP_TextType == null)
+                            {
+                                TMP_TextType = type;
+                                TranslatorCore.LogInfo($"[TypeHelper] Found TMP_Text: {type.FullName} in {asmName}");
+                            }
+                            else if (type.Name == "TMP_FontAsset" && TMP_FontAssetType == null)
+                            {
+                                TMP_FontAssetType = type;
+                            }
+                            else if (type.Name == "TMP_InputField" && TMP_InputFieldType == null)
+                            {
+                                TMP_InputFieldType = type;
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            UseAlternateTMP = false;
         }
 
         private static void ResolveProperties()
