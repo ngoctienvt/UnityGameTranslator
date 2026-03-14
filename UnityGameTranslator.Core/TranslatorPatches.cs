@@ -1161,19 +1161,20 @@ namespace UnityGameTranslator.Core
                             return;
 
                         // Apply fallback font if configured
-                        // Prefer fallback approach (keeps original font, runtime toggle works)
-                        // Fall back to SetFont for old TMP versions without CreateFontAsset
                         if (componentType == "TMP")
                         {
-                            FontManager.EnsureFallbackApplied(fontObj, fontName);
-
-                            // If fallback approach failed (no CreateFontAsset on TMProOld),
-                            // fall back to direct font replacement
-                            if (!FontManager.IsFallbackApplied(fontName))
+                            // TMProOld (UseAlternateTMP) doesn't support fallback fonts —
+                            // use direct SetFont replacement like before
+                            if (TypeHelper.UseAlternateTMP)
                             {
                                 var replacementFont = FontManager.GetTMPReplacementFont(fontName);
                                 if (replacementFont != null)
                                     TypeHelper.SetFont(__instance, replacementFont);
+                            }
+                            else
+                            {
+                                // Modern TMP: prefer fallback approach (keeps original font)
+                                FontManager.EnsureFallbackApplied(fontObj, fontName);
                             }
                         }
                         else if (componentType == "Unity")
