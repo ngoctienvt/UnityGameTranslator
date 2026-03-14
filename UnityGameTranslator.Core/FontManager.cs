@@ -491,6 +491,22 @@ namespace UnityGameTranslator.Core
         // Track which fonts already have our fallback added (by font name)
         private static readonly HashSet<string> _fallbackAppliedFonts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Flag: a new font was created, refresh needed on next scan cycle
+        private static bool _pendingRefresh = false;
+
+        /// <summary>
+        /// Check and consume the pending refresh flag. Called from scan loop.
+        /// </summary>
+        public static bool ConsumePendingRefresh()
+        {
+            if (_pendingRefresh)
+            {
+                _pendingRefresh = false;
+                return true;
+            }
+            return false;
+        }
+
         /// <summary>
         /// Ensure the configured fallback font is added to the original font's fallback list.
         /// Called from Harmony patches on every text set — must be fast (cached check).
@@ -662,9 +678,10 @@ namespace UnityGameTranslator.Core
                     if (replacementFont is UnityEngine.Object uobj && !_gameTMPFonts.ContainsKey(uobj.name))
                         _createdFallbackFontNames.Add(uobj.name);
 
-                    // Font just created — force refresh all text immediately
+                    // Font just created — schedule refresh on next scan cycle
+                    // Can't call ForceRefreshAllText from inside a Harmony prefix
                     TranslatorScanner.ClearProcessedCache();
-                    TranslatorScanner.ForceRefreshAllText();
+                    _pendingRefresh = true;
                 }
                 else
                 {

@@ -1204,6 +1204,13 @@ namespace UnityGameTranslator.Core
         /// </summary>
         public static void ProcessPendingUpdates()
         {
+            // Check if a font was just created and we need to refresh
+            if (FontManager.ConsumePendingRefresh())
+            {
+                ClearProcessedCache();
+                ForceRefreshAllText();
+            }
+
             // Process all pending updates immediately
             while (true)
             {
