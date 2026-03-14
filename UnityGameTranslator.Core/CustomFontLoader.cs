@@ -290,42 +290,137 @@ namespace UnityGameTranslator.Core
         /// <summary>
         /// Initializes type references for TMP classes via reflection.
         /// </summary>
+        /// <summary>
+        /// FindObjectsOfTypeAll compatible with IL2CPP.
+        /// On IL2CPP, Resources.FindObjectsOfTypeAll(Type) may have different signature.
+        /// </summary>
+        private static UnityEngine.Object[] FindObjectsOfTypeAllSafe(Type type)
+        {
+            if (type == null) return new UnityEngine.Object[0];
+
+            // Try direct call
+            try
+            {
+                return Resources.FindObjectsOfTypeAll(type);
+            }
+            catch { }
+
+            // IL2CPP: try via reflection on the actual Resources type
+            try
+            {
+                var resourcesType = typeof(Resources);
+                foreach (var method in resourcesType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                {
+                    if (method.Name != "FindObjectsOfTypeAll") continue;
+                    var parameters = method.GetParameters();
+                    if (parameters.Length != 1) continue;
+
+                    // Accept any single-parameter overload
+                    try
+                    {
+                        object arg = type;
+                        // If the parameter expects an IL2CPP Type, we may need to convert
+                        var paramType = parameters[0].ParameterType;
+                        if (paramType == typeof(Type) || paramType.IsAssignableFrom(typeof(Type)))
+                        {
+                            var result = method.Invoke(null, new object[] { type });
+                            if (result is UnityEngine.Object[] array) return array;
+
+                            // IL2CPP may return Il2CppReferenceArray
+                            if (result != null)
+                            {
+                                var list = new List<UnityEngine.Object>();
+                                if (result is System.Collections.IEnumerable enumerable)
+                                {
+                                    foreach (var item in enumerable)
+                                    {
+                                        if (item is UnityEngine.Object uobj)
+                                            list.Add(uobj);
+                                    }
+                                }
+                                if (list.Count > 0) return list.ToArray();
+                            }
+                        }
+                    }
+                    catch { continue; }
+                }
+            }
+            catch { }
+
+            return new UnityEngine.Object[0];
+        }
+
+        /// <summary>
+        /// Find a type by simple name in an assembly (handles IL2CPP prefixed namespaces).
+        /// </summary>
+        private static Type FindTypeByName(System.Reflection.Assembly asm, string typeName)
+        {
+            try
+            {
+                foreach (var type in asm.GetTypes())
+                {
+                    if (type.Name == typeName)
+                        return type;
+                }
+            }
+            catch { }
+            return null;
+        }
+
         private static void InitializeTypes()
         {
             _typesInitialized = true;
 
-            // Try to find TMP types - first check for TMProOld (alternate TMP)
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            // Use TypeHelper's already-resolved TMP_FontAsset type (handles IL2CPP namespaces like Il2CppTMPro)
+            if (TypeHelper.TMP_FontAssetType != null)
             {
-                // Check for TMProOld first
-                var oldFontAsset = asm.GetType("TMProOld.TMP_FontAsset");
-                if (oldFontAsset != null)
-                {
-                    _tmpFontAssetType = oldFontAsset;
-                    _tmpGlyphType = asm.GetType("TMProOld.TMP_Glyph");
-                    _tmpTextElementType = asm.GetType("TMProOld.TMP_TextElement");
-                    _faceInfoType = asm.GetType("TMProOld.FaceInfo");
-                    _useAlternateTMP = true;
-                    TranslatorCore.LogInfo("[CustomFontLoader] Using TMProOld types");
-                    return;
-                }
+                _tmpFontAssetType = TypeHelper.TMP_FontAssetType;
+                _useAlternateTMP = TypeHelper.UseAlternateTMP;
 
-                // Check for standard TMPro
-                var stdFontAsset = asm.GetType("TMPro.TMP_FontAsset");
-                if (stdFontAsset != null && _tmpFontAssetType == null)
+                // Find related types in the same assembly
+                var asm = _tmpFontAssetType.Assembly;
+                string ns = _tmpFontAssetType.Namespace ?? "";
+
+                // Try exact namespace first, then scan by name
+                _tmpGlyphType = asm.GetType(ns + ".TMP_Glyph") ?? FindTypeByName(asm, "TMP_Glyph");
+                _tmpTextElementType = asm.GetType(ns + ".TMP_TextElement") ?? FindTypeByName(asm, "TMP_TextElement");
+                _faceInfoType = asm.GetType(ns + ".FaceInfo") ?? FindTypeByName(asm, "FaceInfo");
+
+                TranslatorCore.LogInfo($"[CustomFontLoader] Using TypeHelper-resolved types from {asm.GetName().Name} (ns={ns})");
+                TranslatorCore.LogInfo($"[CustomFontLoader] FontAsset={_tmpFontAssetType.Name}, Glyph={_tmpGlyphType?.Name ?? "null"}, FaceInfo={_faceInfoType?.Name ?? "null"}");
+            }
+            else
+            {
+                // Fallback: manual scan (pre-TypeHelper or if TypeHelper failed)
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    _tmpFontAssetType = stdFontAsset;
-                    _tmpGlyphType = asm.GetType("TMPro.TMP_Glyph");
-                    _tmpTextElementType = asm.GetType("TMPro.TMP_TextElement");
-                    _faceInfoType = asm.GetType("TMPro.FaceInfo");
-                    _useAlternateTMP = false;
-                    // Don't return - keep looking for TMProOld
+                    var oldFontAsset = asm.GetType("TMProOld.TMP_FontAsset");
+                    if (oldFontAsset != null)
+                    {
+                        _tmpFontAssetType = oldFontAsset;
+                        _tmpGlyphType = asm.GetType("TMProOld.TMP_Glyph");
+                        _tmpTextElementType = asm.GetType("TMProOld.TMP_TextElement");
+                        _faceInfoType = asm.GetType("TMProOld.FaceInfo");
+                        _useAlternateTMP = true;
+                        TranslatorCore.LogInfo("[CustomFontLoader] Using TMProOld types (fallback)");
+                        return;
+                    }
+
+                    var stdFontAsset = asm.GetType("TMPro.TMP_FontAsset");
+                    if (stdFontAsset != null && _tmpFontAssetType == null)
+                    {
+                        _tmpFontAssetType = stdFontAsset;
+                        _tmpGlyphType = asm.GetType("TMPro.TMP_Glyph");
+                        _tmpTextElementType = asm.GetType("TMPro.TMP_TextElement");
+                        _faceInfoType = asm.GetType("TMPro.FaceInfo");
+                        _useAlternateTMP = false;
+                    }
                 }
             }
 
             if (_tmpFontAssetType != null)
             {
-                TranslatorCore.LogInfo($"[CustomFontLoader] Using {(_useAlternateTMP ? "TMProOld" : "TMPro")} types");
+                TranslatorCore.LogInfo($"[CustomFontLoader] Using {(_useAlternateTMP ? "TMProOld" : _tmpFontAssetType.Namespace)} types");
             }
             else
             {
@@ -348,7 +443,7 @@ namespace UnityGameTranslator.Core
             {
                 // Try to clone an existing font asset first (better initialization)
                 object fontAsset = null;
-                var existingFonts = Resources.FindObjectsOfTypeAll(_tmpFontAssetType);
+                var existingFonts = FindObjectsOfTypeAllSafe(_tmpFontAssetType);
                 foreach (var existingFont in existingFonts)
                 {
                     if (existingFont != null && existingFont.name != "NotoSansDevanagari" && existingFont.name != "KrutiDev714Normal")
@@ -506,7 +601,7 @@ namespace UnityGameTranslator.Core
                 // First, try to find an existing TMP font and copy its material/shader
                 if (_tmpFontAssetType != null)
                 {
-                    var existingFonts = Resources.FindObjectsOfTypeAll(_tmpFontAssetType);
+                    var existingFonts = FindObjectsOfTypeAllSafe(_tmpFontAssetType);
 
                     // Debug: dump structure of first existing font (not our custom ones)
                     if (!_existingFontDumped)
