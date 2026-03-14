@@ -307,8 +307,8 @@ namespace UnityGameTranslator.Core
                 settings.scale = scale;
                 TranslatorCore.LogInfo($"[FontManager] Updated scale for '{fontName}' to {scale:F2}");
 
-                // Clear cached original sizes so ApplyFontScale re-reads current sizes
-                TranslatorPatches.ClearFontSizeCache();
+                // DON'T clear font size cache — it stores TRUE originals
+                // Clearing would cause the scaled size to be read as "original"
 
                 // Refresh all text using this font to apply new scale
                 if (settings.enabled)
@@ -394,16 +394,6 @@ namespace UnityGameTranslator.Core
                     }
                 }
             }
-
-            // Clear font size cache if scale might have changed
-            bool scaleChanged = false;
-            if (TranslatorCore.FontSettingsMap.TryGetValue(fontName, out var currentSettings))
-            {
-                // Scale is set separately via UpdateFontScale, but clear cache on any change
-                scaleChanged = true; // Always clear to be safe
-            }
-            if (scaleChanged)
-                TranslatorPatches.ClearFontSizeCache();
 
             // Refresh all text to re-evaluate with new settings
             if (enabledChanged || (fallbackChanged && enabled))

@@ -239,7 +239,11 @@ namespace UnityGameTranslator.Core
                             string currentText = TypeHelper.GetText(obj);
                             if (!string.IsNullOrEmpty(currentText))
                             {
+                                // Set empty then back to force TMP to re-render
+                                // (setting same text doesn't trigger re-render when fallback changed)
+                                TypeHelper.SetText(obj, "");
                                 TypeHelper.SetText(obj, currentText);
+                                TypeHelper.ForceMeshUpdate(obj);
                                 refreshed++;
                             }
                         }
@@ -381,7 +385,9 @@ namespace UnityGameTranslator.Core
                     string currentText = TypeHelper.GetText(component);
                     if (!string.IsNullOrEmpty(currentText))
                     {
+                        TypeHelper.SetText(component, "");
                         TypeHelper.SetText(component, currentText);
+                        TypeHelper.ForceMeshUpdate(component);
                         refreshed++;
                     }
                 }
@@ -655,7 +661,9 @@ namespace UnityGameTranslator.Core
                     string currentText = TypeHelper.GetText(component);
                     if (!string.IsNullOrEmpty(currentText))
                     {
+                        TypeHelper.SetText(component, "");
                         TypeHelper.SetText(component, currentText);
+                        TypeHelper.ForceMeshUpdate(component);
                         refreshed++;
                     }
                 }

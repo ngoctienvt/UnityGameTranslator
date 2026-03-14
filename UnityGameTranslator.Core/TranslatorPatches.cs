@@ -945,8 +945,9 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Clear cached original font sizes. Call when font scale settings change
-        /// so that ApplyFontScale re-reads the current (unscaled) size.
+        /// Clear cached original font sizes.
+        /// Only call on scene change — NOT on scale change, because
+        /// clearing causes the scaled size to be read as "original".
         /// </summary>
         public static void ClearFontSizeCache()
         {
