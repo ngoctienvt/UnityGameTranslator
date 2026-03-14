@@ -744,7 +744,8 @@ namespace UnityGameTranslator.Core
 
                 // Share IL2CPP methods with TypeHelper for use by other components
                 if (il2cppScanAvailable)
-                    TypeHelper.SetIL2CPPMethods(il2cppTypeOfMethod, resourcesFindAllMethod);
+                    TypeHelper.SetIL2CPPMethods(il2cppTypeOfMethod, resourcesFindAllMethod,
+                        tryCastMethod, tryCastMethod != null && tryCastMethod.IsStatic);
 
                 // Pre-cache generic methods for TMP_Text and Text
                 // Use TypeHelper resolved types instead of compile-time typeof()

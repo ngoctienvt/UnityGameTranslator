@@ -358,41 +358,45 @@ namespace UnityGameTranslator.Core
             try
             {
                 var type = component.GetType();
+                PropertyInfo prop = null;
 
-                // Try cached PropertyInfo first
+                // Find the right font property
                 if (TMP_TextType != null && TMP_TextType.IsAssignableFrom(type) && TMP_FontProp != null && TMP_FontProp.CanWrite)
-                {
-                    TMP_FontProp.SetValue(component, font, null);
-                    return;
-                }
-
-                if (UI_TextType != null && UI_TextType.IsAssignableFrom(type) && UI_FontProp != null && UI_FontProp.CanWrite)
-                {
-                    UI_FontProp.SetValue(component, font, null);
-                    return;
-                }
-
-                if (TextMeshType != null && TextMeshType.IsAssignableFrom(type) && TextMesh_FontProp != null && TextMesh_FontProp.CanWrite)
-                {
-                    TextMesh_FontProp.SetValue(component, font, null);
-                    return;
-                }
+                    prop = TMP_FontProp;
+                else if (UI_TextType != null && UI_TextType.IsAssignableFrom(type) && UI_FontProp != null && UI_FontProp.CanWrite)
+                    prop = UI_FontProp;
+                else if (TextMeshType != null && TextMeshType.IsAssignableFrom(type) && TextMesh_FontProp != null && TextMesh_FontProp.CanWrite)
+                    prop = TextMesh_FontProp;
 
                 // Fallback: look up "font" property on actual instance type
-                var fontProp = type.GetProperty("font", BindingFlags.Public | BindingFlags.Instance);
-                if (fontProp != null && fontProp.CanWrite)
+                if (prop == null)
+                    prop = type.GetProperty("font", BindingFlags.Public | BindingFlags.Instance);
+
+                if (prop == null || !prop.CanWrite)
                 {
-                    fontProp.SetValue(component, font, null);
+                    TranslatorCore.LogWarning($"[TypeHelper] SetFont failed: no writable font property on {type.Name}");
                     return;
                 }
 
-                TranslatorCore.LogWarning($"[TypeHelper] SetFont failed: no writable font property on {type.Name}");
+                // On IL2CPP, the font object must be cast to the exact property type
+                // using TryCast<T>(). Direct assignment of UnityEngine.Object to
+                // Il2CppTMPro.TMP_FontAsset fails without proper IL2CPP casting.
+                var expectedType = prop.PropertyType;
+                var castedFont = Il2CppCast(font, expectedType);
+                prop.SetValue(component, castedFont, null);
             }
             catch (Exception ex)
             {
-                TranslatorCore.LogWarning($"[TypeHelper] SetFont error on {component.GetType().Name}: {ex.Message}");
+                // Log only once per error type to avoid spam
+                if (!_setFontErrorLogged)
+                {
+                    _setFontErrorLogged = true;
+                    TranslatorCore.LogWarning($"[TypeHelper] SetFont error on {component.GetType().Name}: {ex.Message}");
+                }
             }
         }
+
+        private static bool _setFontErrorLogged = false;
 
         /// <summary>
         /// Get fontSize from a text component (TMP_Text or UI.Text).
@@ -705,16 +709,74 @@ namespace UnityGameTranslator.Core
         // Cached IL2CPP methods (populated by TranslatorScanner.InitializeIL2CPP or on first use)
         private static MethodInfo _il2cppTypeOfMethod;
         private static MethodInfo _il2cppResourcesFindAllMethod;
+        private static MethodInfo _il2cppTryCastMethod; // Il2CppObjectBase.TryCast<T>() or IL2CPP.TryCast<T>()
+        private static bool _il2cppTryCastIsStatic;
         private static bool _il2cppHelpersInitialized;
 
         /// <summary>
         /// Initialize IL2CPP helper methods. Call from InitializeIL2CPP after methods are found.
         /// </summary>
-        public static void SetIL2CPPMethods(MethodInfo il2cppTypeOfMethod, MethodInfo resourcesFindAllMethod)
+        public static void SetIL2CPPMethods(MethodInfo il2cppTypeOfMethod, MethodInfo resourcesFindAllMethod,
+            MethodInfo tryCastMethod = null, bool tryCastIsStatic = false)
         {
             _il2cppTypeOfMethod = il2cppTypeOfMethod;
             _il2cppResourcesFindAllMethod = resourcesFindAllMethod;
+            _il2cppTryCastMethod = tryCastMethod;
+            _il2cppTryCastIsStatic = tryCastIsStatic;
             _il2cppHelpersInitialized = true;
+        }
+
+        /// <summary>
+        /// Cast an IL2CPP object to a specific type using TryCast&lt;T&gt;().
+        /// Per MelonLoader docs, IL2CPP objects must be cast with TryCast/Cast, not C# casts.
+        /// Returns the casted object, or the original if casting isn't needed/available.
+        /// </summary>
+        public static object Il2CppCast(object obj, Type targetType)
+        {
+            if (obj == null || targetType == null) return obj;
+
+            // Already the right type?
+            if (targetType.IsInstanceOfType(obj)) return obj;
+
+            // Try IL2CPP TryCast<T>()
+            if (_il2cppTryCastMethod != null)
+            {
+                try
+                {
+                    var typedMethod = _il2cppTryCastMethod.MakeGenericMethod(targetType);
+                    object result;
+                    if (_il2cppTryCastIsStatic)
+                        result = typedMethod.Invoke(null, new[] { obj });
+                    else
+                        result = typedMethod.Invoke(obj, null);
+
+                    if (result != null) return result;
+                }
+                catch { }
+            }
+
+            // Try instance Cast<T>() method on the object itself
+            try
+            {
+                var objType = obj.GetType();
+                foreach (var method in objType.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    if ((method.Name == "Cast" || method.Name == "TryCast") &&
+                        method.IsGenericMethodDefinition && method.GetParameters().Length == 0)
+                    {
+                        try
+                        {
+                            var typedMethod = method.MakeGenericMethod(targetType);
+                            var result = typedMethod.Invoke(obj, null);
+                            if (result != null) return result;
+                        }
+                        catch { continue; }
+                    }
+                }
+            }
+            catch { }
+
+            return obj; // Return original if cast not possible
         }
 
         /// <summary>
