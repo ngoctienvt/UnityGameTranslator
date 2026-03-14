@@ -673,43 +673,230 @@ namespace UnityGameTranslator.Core
                     return gameFont;
                 }
 
-                // System font creation requires CreateDynamicFontFromOSFont
-                if (!_dynamicFontCreationAvailable)
-                {
-                    return null;
-                }
-
-                // Check if font exists in system fonts
-                if (!SystemFonts.Contains(cleanName))
-                {
-                    TranslatorCore.LogWarning($"[FontManager] System font not found: {cleanName}");
-                    return null;
-                }
-
-                // Create Unity font from system font
-                var unityFont = Font.CreateDynamicFontFromOSFont(cleanName, 32);
+                // Create a Unity Font from system font name
+                Font unityFont = CreateUnityFont(cleanName);
                 if (unityFont == null)
                 {
-                    TranslatorCore.LogError($"[FontManager] Failed to create font from: {cleanName}");
+                    TranslatorCore.LogWarning($"[FontManager] Cannot create Font for: {cleanName}");
                     return null;
                 }
 
-                // Create TMP_FontAsset from Unity font
-                var tmpAsset = CreateTMPFontAsset(unityFont);
-                if (tmpAsset == null)
+                // Use TMP_FontAsset.CreateFontAsset(Font) — TMP does ALL the work
+                // (atlas SDF generation, glyph tables, character tables, material, metrics)
+                var tmpAsset = CreateTMPFontAssetFromFont(unityFont);
+                if (tmpAsset != null)
                 {
-                    TranslatorCore.LogWarning($"[FontManager] Failed to create TMP_FontAsset from '{cleanName}' - TMP version may not support dynamic font creation");
-                    return null;
+                    TranslatorCore.LogInfo($"[FontManager] Created TMP_FontAsset from system font: {cleanName}");
+                    return tmpAsset;
                 }
 
-                TranslatorCore.LogInfo($"[FontManager] Created fallback font asset from: {cleanName}");
-                return tmpAsset;
+                // Legacy fallback: manual creation
+                var legacyAsset = CreateTMPFontAsset(unityFont);
+                if (legacyAsset != null)
+                {
+                    TranslatorCore.LogInfo($"[FontManager] Created legacy TMP_FontAsset from: {cleanName}");
+                    return legacyAsset;
+                }
+
+                TranslatorCore.LogWarning($"[FontManager] All font creation methods failed for: {cleanName}");
+                return null;
             }
             catch (Exception ex)
             {
                 TranslatorCore.LogError($"[FontManager] Error creating fallback: {ex.Message}");
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Create a Unity Font from a system font name.
+        /// Tries multiple approaches: CreateDynamicFontFromOSFont, new Font(name), reflection.
+        /// </summary>
+        private static Font CreateUnityFont(string fontName)
+        {
+            // Check if system font exists
+            if (!SystemFonts.Contains(fontName))
+            {
+                TranslatorCore.LogWarning($"[FontManager] System font not found: {fontName}");
+                return null;
+            }
+
+            // Try 1: Font.CreateDynamicFontFromOSFont (Mono, some BepInEx IL2CPP)
+            if (_dynamicFontCreationAvailable)
+            {
+                try
+                {
+                    var font = Font.CreateDynamicFontFromOSFont(fontName, 32);
+                    if (font != null)
+                    {
+                        TranslatorCore.LogInfo($"[FontManager] Created Font via CreateDynamicFontFromOSFont: {fontName}");
+                        return font;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (ex.Message.Contains("unstripping") || ex.Message.Contains("Method not found"))
+                    {
+                        _dynamicFontCreationAvailable = false;
+                        TranslatorCore.LogInfo("[FontManager] CreateDynamicFontFromOSFont unavailable, trying alternatives");
+                    }
+                }
+            }
+
+            // Try 2: new Font(fontName) — creates a font reference by name
+            try
+            {
+                var font = new Font(fontName);
+                if (font != null)
+                {
+                    TranslatorCore.LogInfo($"[FontManager] Created Font via constructor: {fontName}");
+                    return font;
+                }
+            }
+            catch { }
+
+            // Try 3: Reflection — find any Font constructor or factory method
+            try
+            {
+                var fontType = typeof(Font);
+
+                // Try Font(string) constructor via reflection (for IL2CPP)
+                foreach (var ctor in fontType.GetConstructors())
+                {
+                    var parameters = ctor.GetParameters();
+                    if (parameters.Length == 1 && parameters[0].ParameterType == typeof(string))
+                    {
+                        try
+                        {
+                            var font = ctor.Invoke(new object[] { fontName }) as Font;
+                            if (font != null)
+                            {
+                                TranslatorCore.LogInfo($"[FontManager] Created Font via reflected constructor: {fontName}");
+                                return font;
+                            }
+                        }
+                        catch { continue; }
+                    }
+                }
+
+                // Try CreateDynamicFontFromOSFont via reflection (different signature on IL2CPP)
+                foreach (var method in fontType.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+                {
+                    if (method.Name != "CreateDynamicFontFromOSFont") continue;
+                    var parameters = method.GetParameters();
+                    if (parameters.Length >= 2)
+                    {
+                        try
+                        {
+                            var font = method.Invoke(null, new object[] { fontName, 32 }) as Font;
+                            if (font != null)
+                            {
+                                TranslatorCore.LogInfo($"[FontManager] Created Font via reflected CreateDynamicFontFromOSFont: {fontName}");
+                                return font;
+                            }
+                        }
+                        catch { continue; }
+                    }
+                }
+            }
+            catch { }
+
+            TranslatorCore.LogWarning($"[FontManager] All Font creation methods failed for: {fontName}");
+            return null;
+        }
+
+        /// <summary>
+        /// Create a TMP_FontAsset using TMP's own CreateFontAsset method.
+        /// This is the best approach — TMP generates the SDF atlas, glyph tables,
+        /// character tables, material, and metrics automatically.
+        /// </summary>
+        private static object CreateTMPFontAssetFromFont(Font font)
+        {
+            if (font == null || TypeHelper.TMP_FontAssetType == null) return null;
+
+            try
+            {
+                var tmpFontType = TypeHelper.TMP_FontAssetType;
+
+                // Try the simple overload: CreateFontAsset(Font)
+                foreach (var method in tmpFontType.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+                {
+                    if (method.Name != "CreateFontAsset") continue;
+                    if (method.IsGenericMethod) continue;
+
+                    var parameters = method.GetParameters();
+
+                    // Simple version: CreateFontAsset(Font)
+                    if (parameters.Length == 1 && typeof(Font).IsAssignableFrom(parameters[0].ParameterType))
+                    {
+                        try
+                        {
+                            var result = method.Invoke(null, new object[] { font });
+                            if (result != null)
+                            {
+                                TranslatorCore.LogInfo($"[FontManager] TMP_FontAsset.CreateFontAsset(Font) succeeded!");
+                                return result;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            TranslatorCore.LogWarning($"[FontManager] CreateFontAsset(Font) failed: {ex.InnerException?.Message ?? ex.Message}");
+                        }
+                    }
+
+                    // Advanced version: CreateFontAsset(Font, int, int, GlyphRenderMode, int, int, AtlasPopulationMode)
+                    if (parameters.Length >= 6 && typeof(Font).IsAssignableFrom(parameters[0].ParameterType))
+                    {
+                        try
+                        {
+                            // Use Dynamic atlas population so TMP generates glyphs on demand
+                            // Find the AtlasPopulationMode.Dynamic enum value
+                            object dynamicMode = null;
+                            if (parameters.Length >= 7)
+                            {
+                                var popModeType = parameters[6].ParameterType;
+                                dynamicMode = Enum.Parse(popModeType, "Dynamic");
+                            }
+
+                            // Find GlyphRenderMode.SDFAA enum value
+                            object renderMode = null;
+                            var renderModeType = parameters[3].ParameterType;
+                            try { renderMode = Enum.Parse(renderModeType, "SDFAA_HINTED"); } catch { }
+                            if (renderMode == null)
+                                try { renderMode = Enum.Parse(renderModeType, "SDFAA"); } catch { }
+                            if (renderMode == null)
+                                renderMode = Enum.ToObject(renderModeType, 4166); // SDFAA_HINTED numeric
+
+                            var args = new List<object> { font, 48, 5, renderMode, 512, 512 };
+                            if (dynamicMode != null)
+                                args.Add(dynamicMode);
+
+                            // Pad with defaults if more params needed
+                            while (args.Count < parameters.Length)
+                                args.Add(parameters[args.Count].DefaultValue);
+
+                            var result = method.Invoke(null, args.ToArray());
+                            if (result != null)
+                            {
+                                TranslatorCore.LogInfo($"[FontManager] TMP_FontAsset.CreateFontAsset(Font, advanced) succeeded!");
+                                return result;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            TranslatorCore.LogWarning($"[FontManager] CreateFontAsset(Font, advanced) failed: {ex.InnerException?.Message ?? ex.Message}");
+                        }
+                    }
+                }
+
+                TranslatorCore.LogWarning("[FontManager] No compatible CreateFontAsset method found");
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogError($"[FontManager] CreateTMPFontAssetFromFont error: {ex.Message}");
+            }
+
+            return null;
         }
 
         /// <summary>
