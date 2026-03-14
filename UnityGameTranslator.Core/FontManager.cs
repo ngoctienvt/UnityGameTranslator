@@ -384,8 +384,15 @@ namespace UnityGameTranslator.Core
                 // Remove old fallback from the font
                 RemoveFallbackApplied(fontName);
 
-                // If newly enabled with a fallback, it will be re-applied on next text set
-                // via EnsureFallbackApplied in the Harmony patch
+                // Apply new fallback immediately (don't wait for Harmony patch —
+                // on IL2CPP, TypeHelper.SetText doesn't trigger Harmony patches)
+                if (enabled && !string.IsNullOrEmpty(fallbackFont))
+                {
+                    if (_detectedTMPFontObjects.TryGetValue(fontName, out var fontObj))
+                    {
+                        EnsureFallbackApplied(fontObj, fontName);
+                    }
+                }
             }
 
             // Refresh all text to re-evaluate with new settings
