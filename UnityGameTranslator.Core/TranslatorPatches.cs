@@ -2,8 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
-using UnityEngine.UI;
-using TMPro;
 
 namespace UnityGameTranslator.Core
 {
@@ -46,47 +44,62 @@ namespace UnityGameTranslator.Core
 
             try
             {
-                // TMP_Text.text setter
-                var tmpTextType = typeof(TMP_Text);
-                var textProp = tmpTextType.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
-                if (textProp?.SetMethod != null)
+                // TMP_Text.text setter (resolved via TypeHelper to avoid IL2CPP TypeLoadException)
+                if (TypeHelper.TMP_TextType != null)
                 {
-                    var prefix = typeof(TranslatorPatches).GetMethod(nameof(TMPText_SetText_Prefix), BindingFlags.Static | BindingFlags.Public);
-                    patcher(textProp.SetMethod, prefix, null);
-                    patchCount++;
-                }
-
-                // TMP_Text.SetText(string) methods
-                var setTextMethods = tmpTextType.GetMethods(BindingFlags.Public | BindingFlags.Instance);
-                foreach (var method in setTextMethods)
-                {
-                    if (method.Name == "SetText" && method.GetParameters().Length > 0
-                        && method.GetParameters()[0].ParameterType == typeof(string))
+                    var textProp = TypeHelper.TMP_TextType.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
+                    if (textProp?.SetMethod != null)
                     {
-                        var prefix = typeof(TranslatorPatches).GetMethod(nameof(TMPText_SetTextMethod_Prefix), BindingFlags.Static | BindingFlags.Public);
-                        patcher(method, prefix, null);
+                        var prefix = typeof(TranslatorPatches).GetMethod(nameof(TMPText_SetText_Prefix), BindingFlags.Static | BindingFlags.Public);
+                        patcher(textProp.SetMethod, prefix, null);
                         patchCount++;
                     }
+
+                    // TMP_Text.SetText(string) methods
+                    var setTextMethods = TypeHelper.TMP_TextType.GetMethods(BindingFlags.Public | BindingFlags.Instance);
+                    foreach (var method in setTextMethods)
+                    {
+                        if (method.Name == "SetText" && method.GetParameters().Length > 0
+                            && method.GetParameters()[0].ParameterType == typeof(string))
+                        {
+                            var prefix = typeof(TranslatorPatches).GetMethod(nameof(TMPText_SetTextMethod_Prefix), BindingFlags.Static | BindingFlags.Public);
+                            patcher(method, prefix, null);
+                            patchCount++;
+                        }
+                    }
+                    TranslatorCore.LogInfo($"[Patches] TMP_Text patches applied ({TypeHelper.TMP_TextType.FullName})");
+                }
+                else
+                {
+                    TranslatorCore.LogWarning("[Patches] TMP_Text type not found, skipping TMP patches");
                 }
 
                 // UI.Text.text setter
-                var uiTextType = typeof(Text);
-                var uiTextProp = uiTextType.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
-                if (uiTextProp?.SetMethod != null)
+                if (TypeHelper.UI_TextType != null)
                 {
-                    var prefix = typeof(TranslatorPatches).GetMethod(nameof(UIText_SetText_Prefix), BindingFlags.Static | BindingFlags.Public);
-                    patcher(uiTextProp.SetMethod, prefix, null);
-                    patchCount++;
+                    var uiTextProp = TypeHelper.UI_TextType.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
+                    if (uiTextProp?.SetMethod != null)
+                    {
+                        var prefix = typeof(TranslatorPatches).GetMethod(nameof(UIText_SetText_Prefix), BindingFlags.Static | BindingFlags.Public);
+                        patcher(uiTextProp.SetMethod, prefix, null);
+                        patchCount++;
+                    }
+                }
+                else
+                {
+                    TranslatorCore.LogWarning("[Patches] UI.Text type not found, skipping UI patches");
                 }
 
                 // TextMesh.text setter (legacy 3D text)
-                var textMeshType = typeof(TextMesh);
-                var textMeshProp = textMeshType.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
-                if (textMeshProp?.SetMethod != null)
+                if (TypeHelper.TextMeshType != null)
                 {
-                    var prefix = typeof(TranslatorPatches).GetMethod(nameof(TextMesh_SetText_Prefix), BindingFlags.Static | BindingFlags.Public);
-                    patcher(textMeshProp.SetMethod, prefix, null);
-                    patchCount++;
+                    var textMeshProp = TypeHelper.TextMeshType.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
+                    if (textMeshProp?.SetMethod != null)
+                    {
+                        var prefix = typeof(TranslatorPatches).GetMethod(nameof(TextMesh_SetText_Prefix), BindingFlags.Static | BindingFlags.Public);
+                        patcher(textMeshProp.SetMethod, prefix, null);
+                        patchCount++;
+                    }
                 }
 
                 // Unity.Localization.StringTableEntry (optional)
@@ -172,7 +185,8 @@ namespace UnityGameTranslator.Core
         private static List<Type> FindAlternateTMPTypes()
         {
             var results = new List<Type>();
-            var standardTmpType = typeof(TMP_Text);
+            var standardTmpType = TypeHelper.TMP_TextType;
+            if (standardTmpType == null) return results; // No TMP at all
             string standardTmpAssembly = standardTmpType.Assembly.GetName().Name;
 
             // Type names to search for
@@ -595,27 +609,23 @@ namespace UnityGameTranslator.Core
             var go = bridgeComponent.gameObject;
 
             // Try TMP_Text
-            var tmpText = go.GetComponent<TMP_Text>();
-            if (tmpText != null)
+            if (TypeHelper.TMP_TextType != null)
             {
-                return new TextComponentInfo(
-                    tmpText, "TMP",
-                    () => tmpText.text,
-                    (s) => tmpText.text = s,
-                    () => tmpText.font?.name
-                );
+                var tmpComp = go.GetComponent(TypeHelper.TMP_TextType);
+                if (tmpComp != null)
+                {
+                    return CreateReflectionTextComponentInfo(tmpComp, "TMP");
+                }
             }
 
             // Try UI.Text
-            var uiText = go.GetComponent<Text>();
-            if (uiText != null)
+            if (TypeHelper.UI_TextType != null)
             {
-                return new TextComponentInfo(
-                    uiText, "Unity",
-                    () => uiText.text,
-                    (s) => uiText.text = s,
-                    () => uiText.font?.name
-                );
+                var uiComp = go.GetComponent(TypeHelper.UI_TextType);
+                if (uiComp != null)
+                {
+                    return CreateReflectionTextComponentInfo(uiComp, "Unity");
+                }
             }
 
             // Try tk2dTextMesh via reflection
@@ -630,28 +640,23 @@ namespace UnityGameTranslator.Core
         /// </summary>
         private static TextComponentInfo CreateTextComponentInfo(object fieldValue)
         {
-            if (fieldValue is TMP_Text tmpText)
+            if (fieldValue == null) return null;
+
+            var type = fieldValue.GetType();
+
+            // Check TMP
+            if (TypeHelper.TMP_TextType != null && TypeHelper.TMP_TextType.IsAssignableFrom(type))
             {
-                return new TextComponentInfo(
-                    tmpText, "TMP",
-                    () => tmpText.text,
-                    (s) => tmpText.text = s,
-                    () => tmpText.font?.name
-                );
+                return CreateReflectionTextComponentInfo(fieldValue, "TMP");
             }
 
-            if (fieldValue is Text uiText)
+            // Check UI.Text
+            if (TypeHelper.UI_TextType != null && TypeHelper.UI_TextType.IsAssignableFrom(type))
             {
-                return new TextComponentInfo(
-                    uiText, "Unity",
-                    () => uiText.text,
-                    (s) => uiText.text = s,
-                    () => uiText.font?.name
-                );
+                return CreateReflectionTextComponentInfo(fieldValue, "Unity");
             }
 
             // Check for tk2dTextMesh via reflection
-            var type = fieldValue.GetType();
             if (type.Name == "tk2dTextMesh")
             {
                 return CreateTk2dTextComponentInfo(fieldValue, type);
@@ -680,6 +685,19 @@ namespace UnityGameTranslator.Core
             }
             catch { }
             return null;
+        }
+
+        /// <summary>
+        /// Creates TextComponentInfo for TMP or UI.Text using TypeHelper reflection.
+        /// </summary>
+        private static TextComponentInfo CreateReflectionTextComponentInfo(object component, string fontType)
+        {
+            return new TextComponentInfo(
+                component, fontType,
+                () => TypeHelper.GetText(component),
+                (s) => TypeHelper.SetText(component, s),
+                () => TypeHelper.GetFontName(component)
+            );
         }
 
         /// <summary>
@@ -899,33 +917,18 @@ namespace UnityGameTranslator.Core
             new System.Collections.Generic.Dictionary<int, bool>();
 
         /// <summary>
-        /// Check if a Text component is the textComponent of an InputField (should not be translated).
-        /// Caches the result for performance.
+        /// Check if a text component is the textComponent of an InputField (should not be translated).
+        /// Caches the result for performance. Works for both UI.InputField and TMP_InputField.
         /// </summary>
-        private static bool IsInputFieldTextComponent(Text text)
+        private static bool IsInputFieldTextComponentCached(object textComponent)
         {
-            int id = text.GetInstanceID();
+            int id = TypeHelper.GetInstanceID(textComponent);
+            if (id == -1) return false;
+
             if (inputFieldTextCache.TryGetValue(id, out bool isInputFieldText))
                 return isInputFieldText;
 
-            var inputField = text.GetComponentInParent<InputField>();
-            bool result = inputField != null && inputField.textComponent == text;
-            inputFieldTextCache[id] = result;
-            return result;
-        }
-
-        /// <summary>
-        /// Check if a TMP_Text component is the textComponent of a TMP_InputField (should not be translated).
-        /// Caches the result for performance.
-        /// </summary>
-        private static bool IsTMPInputFieldTextComponent(TMP_Text text)
-        {
-            int id = text.GetInstanceID();
-            if (inputFieldTextCache.TryGetValue(id, out bool isInputFieldText))
-                return isInputFieldText;
-
-            var inputField = text.GetComponentInParent<TMPro.TMP_InputField>();
-            bool result = inputField != null && inputField.textComponent == text;
+            bool result = TypeHelper.IsInputFieldTextComponent(textComponent);
             inputFieldTextCache[id] = result;
             return result;
         }
@@ -1072,97 +1075,89 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Apply font scale to a TMP_Text component.
+        /// Apply font scale to a text component (TMP or UI.Text).
         /// Stores original size on first call and applies scale relative to it.
         /// </summary>
-        private static void ApplyFontScale(TMP_Text instance, string fontName)
+        private static void ApplyFontScale(object instance, string fontName)
         {
             if (instance == null || string.IsNullOrEmpty(fontName)) return;
 
             float scale = FontManager.GetFontScale(fontName);
             if (Math.Abs(scale - 1.0f) < 0.001f) return; // No scale needed
 
-            int instanceId = instance.GetInstanceID();
-            float originalSize;
+            int instanceId = TypeHelper.GetInstanceID(instance);
+            if (instanceId == -1) return;
 
+            float originalSize;
             if (!_originalFontSizes.TryGetValue(instanceId, out originalSize))
             {
-                // First time seeing this instance, store its current size as original
-                originalSize = instance.fontSize;
+                originalSize = TypeHelper.GetFontSize(instance);
+                if (originalSize < 0) return;
                 _originalFontSizes[instanceId] = originalSize;
             }
 
             float scaledSize = originalSize * scale;
-            if (Math.Abs(instance.fontSize - scaledSize) > 0.1f)
+            float currentSize = TypeHelper.GetFontSize(instance);
+            if (currentSize >= 0 && Math.Abs(currentSize - scaledSize) > 0.1f)
             {
-                instance.fontSize = scaledSize;
+                TypeHelper.SetFontSize(instance, scaledSize);
             }
         }
 
         /// <summary>
-        /// Apply font scale to a UI.Text component.
-        /// Stores original size on first call and applies scale relative to it.
+        /// Shared prefix logic for TMP/UI/TextMesh text patches.
+        /// Handles font registration, InputField exclusion, translation, and font scale.
         /// </summary>
-        private static void ApplyFontScale(Text instance, string fontName)
+        private static void ProcessTextPatchPrefix(object __instance, ref string textValue, string componentType)
         {
-            if (instance == null || string.IsNullOrEmpty(fontName)) return;
+            if (string.IsNullOrEmpty(textValue)) return;
 
-            float scale = FontManager.GetFontScale(fontName);
-            if (Math.Abs(scale - 1.0f) < 0.001f) return; // No scale needed
-
-            int instanceId = instance.GetInstanceID();
-            float originalSize;
-
-            if (!_originalFontSizes.TryGetValue(instanceId, out originalSize))
-            {
-                // First time seeing this instance, store its current size as original
-                originalSize = instance.fontSize;
-                _originalFontSizes[instanceId] = originalSize;
-            }
-
-            int scaledSize = Mathf.RoundToInt(originalSize * scale);
-            if (instance.fontSize != scaledSize)
-            {
-                instance.fontSize = scaledSize;
-            }
-        }
-
-        public static void TMPText_SetText_Prefix(TMP_Text __instance, ref string value)
-        {
-            if (string.IsNullOrEmpty(value)) return;
             try
             {
+                var comp = __instance as Component;
+                if (comp == null) return;
+
                 // Skip if part of our own UI and should not be translated (uses hierarchy check)
-                // Check this FIRST to avoid registering mod UI fonts
-                if (TranslatorCore.ShouldSkipTranslation(__instance)) return;
+                if (TranslatorCore.ShouldSkipTranslation(comp)) return;
 
                 string fontName = null;
 
-                // Register font for fallback management (non-Latin script support)
-                if (__instance.font != null)
+                // Register font for fallback management
+                object fontObj = TypeHelper.GetFont(__instance);
+                if (fontObj != null)
                 {
-                    fontName = __instance.font.name;
-                    FontManager.RegisterFont(__instance.font);
-                    FontManager.IncrementUsageCount(fontName);
-
-                    // Skip translation if disabled for this font
-                    if (!FontManager.IsTranslationEnabled(__instance.font))
-                        return;
-
-                    // Apply replacement font if configured
-                    var replacementFont = FontManager.GetTMPReplacementFont(__instance.font);
-                    if (replacementFont != null)
+                    fontName = (fontObj is UnityEngine.Object uobj) ? uobj.name : null;
+                    if (!string.IsNullOrEmpty(fontName))
                     {
-                        __instance.font = replacementFont;
+                        FontManager.RegisterFontByName(fontName, componentType);
+                        FontManager.IncrementUsageCount(fontName);
+
+                        // Skip translation if disabled for this font
+                        if (!FontManager.IsTranslationEnabled(fontName))
+                            return;
+
+                        // Apply replacement font if configured
+                        if (componentType == "TMP")
+                        {
+                            var replacementFont = FontManager.GetTMPReplacementFont(fontName);
+                            if (replacementFont != null)
+                                TypeHelper.SetFont(__instance, replacementFont);
+                        }
+                        else if (componentType == "Unity")
+                        {
+                            var replacementFont = FontManager.GetUnityReplacementFont(fontName);
+                            if (replacementFont != null)
+                                TypeHelper.SetFont(__instance, replacementFont);
+                        }
                     }
                 }
 
                 // Don't translate InputField textComponent (user's typed text)
-                if (IsTMPInputFieldTextComponent(__instance)) return;
+                if (componentType != "TextMesh" && IsInputFieldTextComponentCached(__instance)) return;
 
                 // Check if own UI (use UI-specific prompt) - uses hierarchy check
-                bool isOwnUI = TranslatorCore.IsOwnUITranslatable(__instance);
-                value = TranslatorCore.TranslateTextWithTracking(value, __instance, isOwnUI);
+                bool isOwnUI = TranslatorCore.IsOwnUITranslatable(comp);
+                textValue = TranslatorCore.TranslateTextWithTracking(textValue, comp, isOwnUI);
 
                 // Apply font scale if configured for this font
                 ApplyFontScale(__instance, fontName);
@@ -1170,118 +1165,24 @@ namespace UnityGameTranslator.Core
             catch { }
         }
 
-        public static void TMPText_SetTextMethod_Prefix(TMP_Text __instance, ref string __0)
+        public static void TMPText_SetText_Prefix(object __instance, ref string value)
         {
-            if (string.IsNullOrEmpty(__0)) return;
-            try
-            {
-                // Skip if part of our own UI and should not be translated (uses hierarchy check)
-                // Check this FIRST to avoid registering mod UI fonts
-                if (TranslatorCore.ShouldSkipTranslation(__instance)) return;
-
-                string fontName = null;
-
-                // Register font for fallback management (non-Latin script support)
-                if (__instance.font != null)
-                {
-                    fontName = __instance.font.name;
-                    FontManager.RegisterFont(__instance.font);
-                    FontManager.IncrementUsageCount(fontName);
-
-                    // Skip translation if disabled for this font
-                    if (!FontManager.IsTranslationEnabled(__instance.font))
-                        return;
-
-                    // Apply replacement font if configured
-                    var replacementFont = FontManager.GetTMPReplacementFont(__instance.font);
-                    if (replacementFont != null)
-                    {
-                        __instance.font = replacementFont;
-                    }
-                }
-
-                // Don't translate InputField textComponent (user's typed text)
-                if (IsTMPInputFieldTextComponent(__instance)) return;
-
-                // Check if own UI (use UI-specific prompt) - uses hierarchy check
-                bool isOwnUI = TranslatorCore.IsOwnUITranslatable(__instance);
-                __0 = TranslatorCore.TranslateTextWithTracking(__0, __instance, isOwnUI);
-
-                // Apply font scale if configured for this font
-                ApplyFontScale(__instance, fontName);
-            }
-            catch { }
+            ProcessTextPatchPrefix(__instance, ref value, "TMP");
         }
 
-        public static void UIText_SetText_Prefix(Text __instance, ref string value)
+        public static void TMPText_SetTextMethod_Prefix(object __instance, ref string __0)
         {
-            if (string.IsNullOrEmpty(value)) return;
-            try
-            {
-                // Skip if part of our own UI and should not be translated (uses hierarchy check)
-                // Check this FIRST to avoid registering mod UI fonts
-                if (TranslatorCore.ShouldSkipTranslation(__instance)) return;
-
-                string fontName = null;
-
-                // Register font for detection (Unity UI fonts)
-                if (__instance.font != null)
-                {
-                    fontName = __instance.font.name;
-                    FontManager.RegisterFont(__instance.font);
-                    FontManager.IncrementUsageCount(fontName);
-
-                    // Skip translation if disabled for this font
-                    if (!FontManager.IsTranslationEnabled(__instance.font))
-                        return;
-
-                    // Apply replacement font if configured (for non-Latin script support)
-                    var replacementFont = FontManager.GetUnityReplacementFont(__instance.font);
-                    if (replacementFont != null)
-                    {
-                        __instance.font = replacementFont;
-                    }
-                }
-
-                // Don't translate InputField textComponent (user's typed text)
-                if (IsInputFieldTextComponent(__instance)) return;
-
-                // Check if own UI (use UI-specific prompt) - uses hierarchy check
-                bool isOwnUI = TranslatorCore.IsOwnUITranslatable(__instance);
-                value = TranslatorCore.TranslateTextWithTracking(value, __instance, isOwnUI);
-
-                // Apply font scale if configured for this font
-                ApplyFontScale(__instance, fontName);
-            }
-            catch { }
+            ProcessTextPatchPrefix(__instance, ref __0, "TMP");
         }
 
-        public static void TextMesh_SetText_Prefix(TextMesh __instance, ref string value)
+        public static void UIText_SetText_Prefix(object __instance, ref string value)
         {
-            if (string.IsNullOrEmpty(value)) return;
-            try
-            {
-                // Skip if part of our own UI (uses hierarchy check)
-                // Check this FIRST to avoid registering mod UI fonts
-                if (TranslatorCore.ShouldSkipTranslation(__instance)) return;
+            ProcessTextPatchPrefix(__instance, ref value, "Unity");
+        }
 
-                // Register font for detection (legacy 3D text)
-                if (__instance.font != null)
-                {
-                    FontManager.RegisterFont(__instance.font);
-                    FontManager.IncrementUsageCount(__instance.font.name);
-
-                    // Skip translation if disabled for this font
-                    if (!FontManager.IsTranslationEnabled(__instance.font))
-                        return;
-                }
-
-                // TextMesh is legacy 3D text, typically not used for UI input fields
-                // Check if own UI (use UI-specific prompt) - uses hierarchy check
-                bool isOwnUI = TranslatorCore.IsOwnUITranslatable(__instance);
-                value = TranslatorCore.TranslateTextWithTracking(value, __instance, isOwnUI);
-            }
-            catch { }
+        public static void TextMesh_SetText_Prefix(object __instance, ref string value)
+        {
+            ProcessTextPatchPrefix(__instance, ref value, "TextMesh");
         }
 
         /// <summary>
