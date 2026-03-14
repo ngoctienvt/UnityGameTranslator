@@ -923,46 +923,7 @@ namespace UnityGameTranslator.Core
             if (!_loadImageMethodSearched)
             {
                 _loadImageMethodSearched = true;
-
-                // Try to find ImageConversion.LoadImage(Texture2D, byte[])
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    var imageConvType = asm.GetType("UnityEngine.ImageConversion");
-                    if (imageConvType != null)
-                    {
-                        _loadImageMethod = imageConvType.GetMethod("LoadImage",
-                            BindingFlags.Public | BindingFlags.Static,
-                            null,
-                            new Type[] { typeof(Texture2D), typeof(byte[]) },
-                            null);
-
-                        if (_loadImageMethod != null)
-                        {
-                            TranslatorCore.LogInfo("[CustomFontLoader] Found ImageConversion.LoadImage method");
-                            break;
-                        }
-                    }
-                }
-
-                // If not found, try extension method on Texture2D (older Unity)
-                if (_loadImageMethod == null)
-                {
-                    _loadImageMethod = typeof(Texture2D).GetMethod("LoadImage",
-                        BindingFlags.Public | BindingFlags.Instance,
-                        null,
-                        new Type[] { typeof(byte[]) },
-                        null);
-
-                    if (_loadImageMethod != null)
-                    {
-                        TranslatorCore.LogInfo("[CustomFontLoader] Found Texture2D.LoadImage method");
-                    }
-                }
-
-                if (_loadImageMethod == null)
-                {
-                    TranslatorCore.LogWarning("[CustomFontLoader] No LoadImage method found - PNG loading will fail");
-                }
+                FindLoadImageMethod();
             }
 
             if (_loadImageMethod == null)
@@ -970,16 +931,17 @@ namespace UnityGameTranslator.Core
 
             try
             {
+                // Convert byte[] to the expected parameter type if needed (IL2CPP)
+                object dataArg = ConvertByteArrayForMethod(_loadImageMethod, data);
+
                 object result;
                 if (_loadImageMethod.IsStatic)
                 {
-                    // ImageConversion.LoadImage(texture, data)
-                    result = _loadImageMethod.Invoke(null, new object[] { texture, data });
+                    result = _loadImageMethod.Invoke(null, new object[] { texture, dataArg });
                 }
                 else
                 {
-                    // texture.LoadImage(data)
-                    result = _loadImageMethod.Invoke(texture, new object[] { data });
+                    result = _loadImageMethod.Invoke(texture, new object[] { dataArg });
                 }
 
                 return result is bool b && b;
@@ -989,6 +951,126 @@ namespace UnityGameTranslator.Core
                 TranslatorCore.LogWarning($"[CustomFontLoader] LoadImage failed: {ex.Message}");
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Find the LoadImage method, handling IL2CPP where parameter types differ.
+        /// On IL2CPP, byte[] parameters become Il2CppStructArray&lt;byte&gt;.
+        /// </summary>
+        private static void FindLoadImageMethod()
+        {
+            // Strategy: search by name, accept any overload with 2 params (static) or 1 param (instance)
+            // that has a byte-array-like second/first parameter
+
+            // Try ImageConversion.LoadImage first (newer Unity)
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var imageConvType = asm.GetType("UnityEngine.ImageConversion");
+                if (imageConvType == null) continue;
+
+                foreach (var method in imageConvType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                {
+                    if (method.Name != "LoadImage") continue;
+                    var parameters = method.GetParameters();
+                    // Looking for LoadImage(Texture2D, byte[]) — 2 params, second is byte-array-like
+                    if (parameters.Length == 2 && IsTextureType(parameters[0].ParameterType) && IsByteArrayType(parameters[1].ParameterType))
+                    {
+                        _loadImageMethod = method;
+                        TranslatorCore.LogInfo($"[CustomFontLoader] Found ImageConversion.LoadImage({parameters[0].ParameterType.Name}, {parameters[1].ParameterType.Name})");
+                        return;
+                    }
+                }
+            }
+
+            // Try Texture2D.LoadImage(byte[]) (older Unity or instance method)
+            var texType = typeof(Texture2D);
+            // On IL2CPP, the actual runtime type may be different
+            foreach (var method in texType.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (method.Name != "LoadImage") continue;
+                var parameters = method.GetParameters();
+                if (parameters.Length == 1 && IsByteArrayType(parameters[0].ParameterType))
+                {
+                    _loadImageMethod = method;
+                    TranslatorCore.LogInfo($"[CustomFontLoader] Found Texture2D.LoadImage({parameters[0].ParameterType.Name})");
+                    return;
+                }
+            }
+
+            TranslatorCore.LogWarning("[CustomFontLoader] No LoadImage method found");
+        }
+
+        /// <summary>
+        /// Check if a type is a Texture2D or IL2CPP equivalent.
+        /// </summary>
+        private static bool IsTextureType(Type type)
+        {
+            return typeof(Texture2D).IsAssignableFrom(type) || type.Name.Contains("Texture2D");
+        }
+
+        /// <summary>
+        /// Check if a type is byte[] or an IL2CPP byte array equivalent.
+        /// </summary>
+        private static bool IsByteArrayType(Type type)
+        {
+            if (type == typeof(byte[])) return true;
+            // IL2CPP: Il2CppStructArray<byte>, Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray`1[System.Byte]
+            if (type.Name.Contains("Array") && type.FullName != null && type.FullName.Contains("Byte")) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Convert a byte[] to the type expected by the method parameter (handles IL2CPP array types).
+        /// </summary>
+        private static object ConvertByteArrayForMethod(MethodInfo method, byte[] data)
+        {
+            var parameters = method.GetParameters();
+            // Find the byte-array parameter
+            Type expectedType = null;
+            foreach (var param in parameters)
+            {
+                if (IsByteArrayType(param.ParameterType))
+                {
+                    expectedType = param.ParameterType;
+                    break;
+                }
+            }
+
+            if (expectedType == null || expectedType == typeof(byte[]))
+                return data; // Direct byte[] works
+
+            // Need to convert to IL2CPP array type
+            try
+            {
+                // Try constructor that accepts byte[]
+                var ctor = expectedType.GetConstructor(new Type[] { typeof(byte[]) });
+                if (ctor != null)
+                {
+                    return ctor.Invoke(new object[] { data });
+                }
+
+                // Try constructor(int) + indexer copy
+                ctor = expectedType.GetConstructor(new Type[] { typeof(int) });
+                if (ctor != null)
+                {
+                    var il2cppArray = ctor.Invoke(new object[] { data.Length });
+                    var indexer = expectedType.GetProperty("Item");
+                    if (indexer != null)
+                    {
+                        for (int i = 0; i < data.Length; i++)
+                            indexer.SetValue(il2cppArray, data[i], new object[] { i });
+                        return il2cppArray;
+                    }
+                }
+
+                TranslatorCore.LogWarning($"[CustomFontLoader] Cannot convert byte[] to {expectedType.Name}");
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogWarning($"[CustomFontLoader] byte[] conversion failed: {ex.Message}");
+            }
+
+            return data; // Fallback, may fail
         }
 
         /// <summary>
