@@ -662,8 +662,9 @@ namespace UnityGameTranslator.Core
                     if (replacementFont is UnityEngine.Object uobj && !_gameTMPFonts.ContainsKey(uobj.name))
                         _createdFallbackFontNames.Add(uobj.name);
 
-                    // Font just created — refresh all text so components pick it up
+                    // Font just created — force refresh all text immediately
                     TranslatorScanner.ClearProcessedCache();
+                    TranslatorScanner.ForceRefreshAllText();
                 }
                 else
                 {
