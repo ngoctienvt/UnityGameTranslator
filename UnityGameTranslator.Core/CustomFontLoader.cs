@@ -351,6 +351,67 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
+        /// ScriptableObject.CreateInstance compatible with IL2CPP.
+        /// On IL2CPP, the Type parameter may need to be an IL2CPP Type wrapper.
+        /// </summary>
+        private static UnityEngine.Object CreateScriptableObjectSafe(Type type)
+        {
+            // Try direct call first
+            try
+            {
+                return ScriptableObject.CreateInstance(type);
+            }
+            catch { }
+
+            // IL2CPP: try via reflection
+            try
+            {
+                var soType = typeof(ScriptableObject);
+                foreach (var method in soType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                {
+                    if (method.Name != "CreateInstance") continue;
+                    if (method.IsGenericMethod) continue;
+                    var parameters = method.GetParameters();
+                    if (parameters.Length != 1) continue;
+
+                    try
+                    {
+                        var result = method.Invoke(null, new object[] { type });
+                        if (result is UnityEngine.Object uobj)
+                            return uobj;
+                    }
+                    catch { continue; }
+                }
+
+                // Try generic version: ScriptableObject.CreateInstance<T>()
+                var genericMethod = soType.GetMethod("CreateInstance", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
+                if (genericMethod != null && genericMethod.IsGenericMethodDefinition)
+                {
+                    var specific = genericMethod.MakeGenericMethod(type);
+                    var result = specific.Invoke(null, null);
+                    if (result is UnityEngine.Object uobj)
+                        return uobj;
+                }
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogWarning($"[CustomFontLoader] CreateInstance reflection failed: {ex.Message}");
+            }
+
+            // Last resort: try Activator.CreateInstance
+            try
+            {
+                var obj = Activator.CreateInstance(type);
+                if (obj is UnityEngine.Object uobj)
+                    return uobj;
+            }
+            catch { }
+
+            TranslatorCore.LogWarning($"[CustomFontLoader] Cannot create ScriptableObject of type {type.Name}");
+            return null;
+        }
+
+        /// <summary>
         /// Find a type by simple name in an assembly (handles IL2CPP prefixed namespaces).
         /// </summary>
         private static Type FindTypeByName(System.Reflection.Assembly asm, string typeName)
@@ -459,7 +520,7 @@ namespace UnityGameTranslator.Core
                 // Fallback to creating new instance if no font to clone
                 if (fontAsset == null)
                 {
-                    fontAsset = ScriptableObject.CreateInstance(_tmpFontAssetType);
+                    fontAsset = CreateScriptableObjectSafe(_tmpFontAssetType);
                     ((UnityEngine.Object)fontAsset).name = fontInfo.Name;
                     TranslatorCore.LogInfo("[CustomFontLoader] Created new font asset instance");
                 }
