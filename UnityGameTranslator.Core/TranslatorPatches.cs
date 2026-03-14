@@ -1150,15 +1150,16 @@ namespace UnityGameTranslator.Core
                         if (!FontManager.IsTranslationEnabled(fontName))
                             return;
 
-                        // Apply replacement font if configured
+                        // Apply fallback font if configured (add to font's fallback list, don't replace)
+                        // This keeps the original font on the component so font-name-based
+                        // settings lookup continues to work at runtime
                         if (componentType == "TMP")
                         {
-                            var replacementFont = FontManager.GetTMPReplacementFont(fontName);
-                            if (replacementFont != null)
-                                TypeHelper.SetFont(__instance, replacementFont);
+                            FontManager.EnsureFallbackApplied(fontObj, fontName);
                         }
                         else if (componentType == "Unity")
                         {
+                            // Unity UI.Text doesn't support fallback — still need SetFont for these
                             var replacementFont = FontManager.GetUnityReplacementFont(fontName);
                             if (replacementFont != null)
                                 TypeHelper.SetFont(__instance, replacementFont);

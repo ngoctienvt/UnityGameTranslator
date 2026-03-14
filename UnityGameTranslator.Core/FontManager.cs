@@ -378,26 +378,19 @@ namespace UnityGameTranslator.Core
             settings.enabled = enabled;
             settings.fallback = fallbackFont;
 
-            // Apply or remove fallback for TMP fonts
-            if (_detectedTMPFontObjects.TryGetValue(fontName, out object tmpFontObj))
+            // Handle fallback changes
+            if (fallbackChanged || enabledChanged)
             {
-                if (!string.IsNullOrEmpty(fallbackFont) && fallbackChanged)
-                {
-                    ApplyFallbackToFont(tmpFontObj, fallbackFont);
-                }
-                else if (string.IsNullOrEmpty(fallbackFont))
-                {
-                    RemoveFallbackFromFont(tmpFontObj);
-                }
+                // Remove old fallback from the font
+                RemoveFallbackApplied(fontName);
+
+                // If newly enabled with a fallback, it will be re-applied on next text set
+                // via EnsureFallbackApplied in the Harmony patch
             }
 
-            // Handle translation toggle / fallback change
-            // Use ForceRefreshAllText because when a font is replaced,
-            // components have the replacement font name, not the original.
-            // Targeted refresh by font name can't find them reliably.
+            // Refresh all text to re-evaluate with new settings
             if (enabledChanged || (fallbackChanged && enabled))
             {
-                // Clear all processed hashes to force re-evaluation
                 TranslatorScanner.ClearProcessedCache();
                 TranslatorScanner.ForceRefreshAllText();
             }
@@ -486,6 +479,70 @@ namespace UnityGameTranslator.Core
                 }
             }
             catch { }
+        }
+
+        // Track which fonts already have our fallback added (by font name)
+        private static readonly HashSet<string> _fallbackAppliedFonts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Ensure the configured fallback font is added to the original font's fallback list.
+        /// Called from Harmony patches on every text set — must be fast (cached check).
+        /// Does NOT replace the font on the component. TMP uses fallback fonts automatically
+        /// for characters not found in the primary font.
+        /// </summary>
+        public static void EnsureFallbackApplied(object fontObj, string fontName)
+        {
+            if (fontObj == null || string.IsNullOrEmpty(fontName)) return;
+
+            // Fast path: already applied
+            if (_fallbackAppliedFonts.Contains(fontName)) return;
+
+            // Check if fallback is configured
+            if (!TranslatorCore.FontSettingsMap.TryGetValue(fontName, out var settings))
+                return;
+            if (string.IsNullOrEmpty(settings.fallback))
+                return;
+
+            // Check if already tried and failed
+            if (_failedFallbackFontNames.Contains(settings.fallback))
+                return;
+
+            // Get or create the fallback font asset
+            if (!_fallbackAssets.TryGetValue(settings.fallback, out var fallbackAsset))
+            {
+                fallbackAsset = CreateFallbackAsset(settings.fallback);
+                if (fallbackAsset != null)
+                {
+                    _fallbackAssets[settings.fallback] = fallbackAsset;
+                    if (fallbackAsset is UnityEngine.Object uobj && !_gameTMPFonts.ContainsKey(uobj.name))
+                        _createdFallbackFontNames.Add(uobj.name);
+                }
+                else
+                {
+                    _failedFallbackFontNames.Add(settings.fallback);
+                    return;
+                }
+            }
+
+            // Add to the original font's fallback list
+            if (ApplyFallbackToFont(fontObj, settings.fallback))
+            {
+                _fallbackAppliedFonts.Add(fontName);
+                TranslatorCore.LogInfo($"[FontManager] Applied fallback '{settings.fallback}' to font '{fontName}'");
+            }
+        }
+
+        /// <summary>
+        /// Remove fallback from a font and clear the applied cache.
+        /// Call when fallback settings change.
+        /// </summary>
+        public static void RemoveFallbackApplied(string fontName)
+        {
+            _fallbackAppliedFonts.Remove(fontName);
+            if (_detectedTMPFontObjects.TryGetValue(fontName, out var fontObj))
+            {
+                RemoveFallbackFromFont(fontObj);
+            }
         }
 
         /// <summary>
@@ -1416,6 +1473,7 @@ namespace UnityGameTranslator.Core
             _failedFallbackFontNames.Clear();
             _gameTMPFonts.Clear();
             _gameFontsScanned = false;
+            _fallbackAppliedFonts.Clear();
         }
 
         /// <summary>
