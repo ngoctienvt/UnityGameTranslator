@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 
 namespace UnityGameTranslator.Core
@@ -750,29 +751,65 @@ namespace UnityGameTranslator.Core
                         }
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    TranslatorCore.LogWarning($"[TypeHelper] IL2CPP FindAllObjectsOfType failed for {type.Name}: {ex.Message}");
+                }
             }
 
-            // Mono path: direct call
+            // Mono path: use reflection ONLY to avoid MissingMethodException at JIT time on IL2CPP
+            // Direct calls to UnityEngine.Object.FindObjectsOfType(Type) crash on IL2CPP
+            // because the method doesn't exist and JIT resolves references before try/catch
+            return FindAllObjectsOfTypeMono(type);
+        }
+
+        /// <summary>
+        /// Mono-only fallback using pure reflection (no direct Unity method references).
+        /// NoInlining prevents JIT from resolving these method references on IL2CPP.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static UnityEngine.Object[] FindAllObjectsOfTypeMono(Type type)
+        {
+            // Use reflection for ALL calls to avoid JIT resolution issues
             try
             {
+                // Try FindObjectsOfType(Type, bool) via reflection
                 var method = typeof(UnityEngine.Object).GetMethod("FindObjectsOfType",
                     BindingFlags.Public | BindingFlags.Static,
                     null, new Type[] { typeof(Type), typeof(bool) }, null);
                 if (method != null)
-                    return method.Invoke(null, new object[] { type, true }) as UnityEngine.Object[];
+                {
+                    var result = method.Invoke(null, new object[] { type, true }) as UnityEngine.Object[];
+                    if (result != null) return result;
+                }
             }
             catch { }
 
             try
             {
-                return UnityEngine.Object.FindObjectsOfType(type);
+                // Try FindObjectsOfType(Type) via reflection
+                var method = typeof(UnityEngine.Object).GetMethod("FindObjectsOfType",
+                    BindingFlags.Public | BindingFlags.Static,
+                    null, new Type[] { typeof(Type) }, null);
+                if (method != null)
+                {
+                    var result = method.Invoke(null, new object[] { type }) as UnityEngine.Object[];
+                    if (result != null) return result;
+                }
             }
             catch { }
 
             try
             {
-                return Resources.FindObjectsOfTypeAll(type);
+                // Try Resources.FindObjectsOfTypeAll(Type) via reflection
+                var method = typeof(Resources).GetMethod("FindObjectsOfTypeAll",
+                    BindingFlags.Public | BindingFlags.Static,
+                    null, new Type[] { typeof(Type) }, null);
+                if (method != null)
+                {
+                    var result = method.Invoke(null, new object[] { type }) as UnityEngine.Object[];
+                    if (result != null) return result;
+                }
             }
             catch { }
 
@@ -781,19 +818,15 @@ namespace UnityGameTranslator.Core
 
         /// <summary>
         /// Create a ScriptableObject of a given type, compatible with IL2CPP.
+        /// Uses generic CreateInstance&lt;T&gt;() which works on IL2CPP,
+        /// unlike CreateInstance(Type) which has signature mismatch.
         /// </summary>
         public static UnityEngine.Object CreateScriptableObject(Type type)
         {
             if (type == null) return null;
 
-            // Try direct call
-            try
-            {
-                return ScriptableObject.CreateInstance(type);
-            }
-            catch { }
-
-            // IL2CPP: the generic version ScriptableObject.CreateInstance<T>() may work
+            // Try generic version first: ScriptableObject.CreateInstance<T>()
+            // This works on both Mono and IL2CPP
             try
             {
                 var soType = typeof(ScriptableObject);
@@ -817,7 +850,28 @@ namespace UnityGameTranslator.Core
             }
             catch { }
 
-            // Try Activator as last resort
+            // Fallback: non-generic via reflection (avoids JIT issues)
+            return CreateScriptableObjectMono(type);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static UnityEngine.Object CreateScriptableObjectMono(Type type)
+        {
+            try
+            {
+                // Try CreateInstance(Type) via reflection
+                var method = typeof(ScriptableObject).GetMethod("CreateInstance",
+                    BindingFlags.Public | BindingFlags.Static,
+                    null, new Type[] { typeof(Type) }, null);
+                if (method != null)
+                {
+                    var result = method.Invoke(null, new object[] { type });
+                    if (result is UnityEngine.Object uobj)
+                        return uobj;
+                }
+            }
+            catch { }
+
             try
             {
                 var obj = Activator.CreateInstance(type);
