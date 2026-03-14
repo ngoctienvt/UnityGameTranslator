@@ -447,18 +447,20 @@ namespace UnityGameTranslator.Core
         /// Restore originals for components using a specific font.
         /// Call when per-font translation is disabled.
         /// </summary>
-        public static void RestoreOriginalsForFont(string fontName)
+        public static void RestoreOriginalsForFont(string fontName, string oldFallback = null)
         {
             if (string.IsNullOrEmpty(fontName)) return;
             int restored = 0;
 
             try
             {
-                // Match both original font AND any replacement that was applied
+                // Match original + new fallback + old fallback
                 var fontNamesToMatch = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { fontName };
-                string fallback = FontManager.GetConfiguredFallback(fontName);
-                if (!string.IsNullOrEmpty(fallback))
-                    fontNamesToMatch.Add(fallback);
+                string newFallback = FontManager.GetConfiguredFallback(fontName);
+                if (!string.IsNullOrEmpty(newFallback))
+                    fontNamesToMatch.Add(newFallback);
+                if (!string.IsNullOrEmpty(oldFallback))
+                    fontNamesToMatch.Add(oldFallback);
 
                 // Restore Mono components with this font (TMP + UI.Text)
                 restored += RestoreOriginalsForFontInCache(cachedTMPMono, fontNamesToMatch);
@@ -481,7 +483,7 @@ namespace UnityGameTranslator.Core
         /// Re-translate components for a specific font.
         /// Call when per-font translation is re-enabled.
         /// </summary>
-        public static void RefreshForFont(string fontName)
+        public static void RefreshForFont(string fontName, string oldFallback = null)
         {
             if (string.IsNullOrEmpty(fontName)) return;
             int refreshed = 0;
@@ -491,12 +493,13 @@ namespace UnityGameTranslator.Core
                 // Force cache refresh to capture all current components
                 ForceRefreshCache();
 
-                // Build set of font names to match: the original font AND any replacement
-                // that may have already been applied (so we can re-process those components too)
+                // Build set of font names to match: original + new fallback + OLD fallback
                 var fontNamesToMatch = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { fontName };
-                string fallback = FontManager.GetConfiguredFallback(fontName);
-                if (!string.IsNullOrEmpty(fallback))
-                    fontNamesToMatch.Add(fallback);
+                string newFallback = FontManager.GetConfiguredFallback(fontName);
+                if (!string.IsNullOrEmpty(newFallback))
+                    fontNamesToMatch.Add(newFallback);
+                if (!string.IsNullOrEmpty(oldFallback))
+                    fontNamesToMatch.Add(oldFallback);
 
                 TranslatorCore.LogInfo($"[Scanner] RefreshForFont: matching fonts [{string.Join(", ", fontNamesToMatch)}], caches: TMP={cachedTMPMono?.Length ?? 0}, UI={cachedUIMono?.Length ?? 0}");
 

@@ -373,6 +373,7 @@ namespace UnityGameTranslator.Core
             bool enabledChanged = settings.enabled != enabled;
             bool fallbackChanged = settings.fallback != fallbackFont;
             bool wasEnabled = settings.enabled;
+            string oldFallback = settings.fallback; // Save BEFORE changing
 
             settings.enabled = enabled;
             settings.fallback = fallbackFont;
@@ -395,20 +396,16 @@ namespace UnityGameTranslator.Core
             {
                 if (wasEnabled && !enabled)
                 {
-                    // Translation disabled for this font: restore originals
-                    TranslatorScanner.RestoreOriginalsForFont(fontName);
+                    TranslatorScanner.RestoreOriginalsForFont(fontName, oldFallback);
                 }
                 else if (!wasEnabled && enabled)
                 {
-                    // Translation enabled for this font: refresh to translate
-                    TranslatorScanner.RefreshForFont(fontName);
+                    TranslatorScanner.RefreshForFont(fontName, oldFallback);
                 }
             }
             else if (fallbackChanged && enabled)
             {
-                // Fallback font changed while translation enabled: refresh to apply new font
-                // This is needed for Unity Fonts where GetUnityReplacementFont() is called on each text set
-                TranslatorScanner.RefreshForFont(fontName);
+                TranslatorScanner.RefreshForFont(fontName, oldFallback);
             }
 
             // Save changes
