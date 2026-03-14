@@ -868,16 +868,24 @@ namespace UnityGameTranslator.Core
             {
                 var tmpFontType = TypeHelper.TMP_FontAssetType;
 
-                // Try the simple overload: CreateFontAsset(Font)
+                // Try ALL CreateFontAsset overloads, match Font by name (IL2CPP: Il2CppUnityEngine.Font)
                 foreach (var method in tmpFontType.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
                 {
                     if (method.Name != "CreateFontAsset") continue;
                     if (method.IsGenericMethod) continue;
 
                     var parameters = method.GetParameters();
+                    if (parameters.Length == 0) continue;
+
+                    // Check first param is Font-like (handles IL2CPP type name mismatch)
+                    bool firstParamIsFont = typeof(Font).IsAssignableFrom(parameters[0].ParameterType)
+                        || parameters[0].ParameterType.Name.Contains("Font");
+                    if (!firstParamIsFont) continue;
+
+                    TranslatorCore.LogInfo($"[FontManager] Trying CreateFontAsset overload: {parameters.Length} params ({string.Join(",", parameters.Select(p => p.ParameterType.Name))})");
 
                     // Simple version: CreateFontAsset(Font)
-                    if (parameters.Length == 1 && typeof(Font).IsAssignableFrom(parameters[0].ParameterType))
+                    if (parameters.Length == 1)
                     {
                         try
                         {
@@ -894,28 +902,33 @@ namespace UnityGameTranslator.Core
                         }
                     }
 
-                    // Advanced version: CreateFontAsset(Font, int, int, GlyphRenderMode, int, int, AtlasPopulationMode)
-                    if (parameters.Length >= 6 && typeof(Font).IsAssignableFrom(parameters[0].ParameterType))
+                    // Advanced version with enums
+                    if (parameters.Length >= 6)
                     {
                         try
                         {
-                            // Use Dynamic atlas population so TMP generates glyphs on demand
-                            // Find the AtlasPopulationMode.Dynamic enum value
+                            // Build enum values safely (IL2CPP enums may not be System.Enum)
+                            object renderMode = null;
+                            var renderModeType = parameters[3].ParameterType;
+                            if (renderModeType.IsEnum)
+                            {
+                                try { renderMode = Enum.Parse(renderModeType, "SDFAA_HINTED"); } catch { }
+                                if (renderMode == null)
+                                    try { renderMode = Enum.Parse(renderModeType, "SDFAA"); } catch { }
+                            }
+                            if (renderMode == null)
+                                renderMode = Enum.ToObject(typeof(int), 4166); // raw int fallback
+
+                            // AtlasPopulationMode.Dynamic
                             object dynamicMode = null;
                             if (parameters.Length >= 7)
                             {
                                 var popModeType = parameters[6].ParameterType;
-                                dynamicMode = Enum.Parse(popModeType, "Dynamic");
+                                if (popModeType.IsEnum)
+                                    try { dynamicMode = Enum.Parse(popModeType, "Dynamic"); } catch { }
+                                if (dynamicMode == null)
+                                    dynamicMode = 1; // Dynamic = 1 typically
                             }
-
-                            // Find GlyphRenderMode.SDFAA enum value
-                            object renderMode = null;
-                            var renderModeType = parameters[3].ParameterType;
-                            try { renderMode = Enum.Parse(renderModeType, "SDFAA_HINTED"); } catch { }
-                            if (renderMode == null)
-                                try { renderMode = Enum.Parse(renderModeType, "SDFAA"); } catch { }
-                            if (renderMode == null)
-                                renderMode = Enum.ToObject(renderModeType, 4166); // SDFAA_HINTED numeric
 
                             var args = new List<object> { font, 48, 5, renderMode, 512, 512 };
                             if (dynamicMode != null)
