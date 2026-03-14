@@ -237,7 +237,7 @@ namespace UnityGameTranslator.Core
                 // Debug: Check if texture has actual content (not all white/transparent)
                 try
                 {
-                    byte[] rawSample = texture.GetRawTextureData();
+                    byte[] rawSample = GetRawTextureDataSafe(texture);
                     int bpp = GetBytesPerPixel(texture.format);
                     int pixelCount = rawSample.Length / bpp;
                     int sampleSize = Math.Min(100, pixelCount);
@@ -1002,8 +1002,9 @@ namespace UnityGameTranslator.Core
 
             try
             {
-                // Use GetRawTextureData for maximum compatibility (works on IL2CPP where GetPixels/GetPixels32 may not exist)
-                byte[] rawData = texture.GetRawTextureData();
+                // Use reflection-safe GetRawTextureData for IL2CPP compatibility
+                // On IL2CPP, the method returns Il2CppStructArray<byte> instead of byte[]
+                byte[] rawData = GetRawTextureDataSafe(texture);
                 if (rawData == null || rawData.Length == 0)
                 {
                     TranslatorCore.LogWarning("[CustomFontLoader] GetRawTextureData returned empty");
@@ -1056,7 +1057,11 @@ namespace UnityGameTranslator.Core
                         rawData[idx + 2] = 255; // B = white
                         rawData[idx + alphaOffset] = r; // A = original R (SDF distance)
                     }
-                    texture.LoadRawTextureData(rawData);
+                    if (!LoadRawTextureDataSafe(texture, rawData))
+                    {
+                        TranslatorCore.LogWarning("[CustomFontLoader] Failed to write converted texture data back");
+                        return;
+                    }
                     texture.Apply();
                     TranslatorCore.LogInfo("[CustomFontLoader] SDF texture conversion complete");
                 }
@@ -1069,6 +1074,152 @@ namespace UnityGameTranslator.Core
             {
                 TranslatorCore.LogWarning($"[CustomFontLoader] Failed to convert SDF texture: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Get raw texture data via reflection.
+        /// On IL2CPP, GetRawTextureData() returns Il2CppStructArray&lt;byte&gt; instead of byte[].
+        /// This method handles both cases.
+        /// </summary>
+        private static byte[] GetRawTextureDataSafe(Texture2D texture)
+        {
+            if (texture == null) return null;
+
+            var type = texture.GetType();
+
+            // Try all GetRawTextureData overloads via reflection
+            foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (method.Name != "GetRawTextureData") continue;
+                if (method.GetParameters().Length != 0) continue;
+                if (method.IsGenericMethod) continue;
+
+                try
+                {
+                    var result = method.Invoke(texture, null);
+                    if (result == null) continue;
+
+                    // Direct byte[] (Mono)
+                    if (result is byte[] bytes)
+                        return bytes;
+
+                    // IL2CPP: result is Il2CppStructArray<byte> or similar
+                    // It implements IEnumerable and has a Length property
+                    var resultType = result.GetType();
+
+                    // Try to get Length
+                    var lengthProp = resultType.GetProperty("Length") ?? resultType.GetProperty("Count");
+                    if (lengthProp == null) continue;
+
+                    int length = (int)lengthProp.GetValue(result, null);
+                    if (length == 0) continue;
+
+                    // Try indexer access
+                    var indexer = resultType.GetProperty("Item");
+                    if (indexer != null)
+                    {
+                        byte[] data = new byte[length];
+                        for (int i = 0; i < length; i++)
+                        {
+                            data[i] = (byte)indexer.GetValue(result, new object[] { i });
+                        }
+                        return data;
+                    }
+
+                    // Try as IList<byte> or IEnumerable
+                    if (result is System.Collections.IEnumerable enumerable)
+                    {
+                        var list = new List<byte>();
+                        foreach (var item in enumerable)
+                        {
+                            if (item is byte b)
+                                list.Add(b);
+                        }
+                        if (list.Count > 0)
+                            return list.ToArray();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    TranslatorCore.LogWarning($"[CustomFontLoader] GetRawTextureData reflection failed: {ex.Message}");
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Load raw texture data via reflection.
+        /// On IL2CPP, LoadRawTextureData may expect Il2CppStructArray&lt;byte&gt; instead of byte[].
+        /// </summary>
+        private static bool LoadRawTextureDataSafe(Texture2D texture, byte[] data)
+        {
+            if (texture == null || data == null) return false;
+
+            var type = texture.GetType();
+
+            // Try direct call first (works on Mono)
+            try
+            {
+                texture.LoadRawTextureData(data);
+                return true;
+            }
+            catch { }
+
+            // IL2CPP: try via reflection, find a LoadRawTextureData that accepts our data
+            foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (method.Name != "LoadRawTextureData") continue;
+                var parameters = method.GetParameters();
+                if (parameters.Length != 1) continue;
+
+                var paramType = parameters[0].ParameterType;
+
+                // If it accepts byte[], call directly
+                if (paramType == typeof(byte[]))
+                {
+                    try
+                    {
+                        method.Invoke(texture, new object[] { data });
+                        return true;
+                    }
+                    catch { continue; }
+                }
+
+                // If it accepts Il2CppStructArray<byte> or similar, try to construct one
+                try
+                {
+                    // Try to create an instance of the expected type from byte[]
+                    var ctor = paramType.GetConstructor(new Type[] { typeof(byte[]) });
+                    if (ctor != null)
+                    {
+                        var il2cppArray = ctor.Invoke(new object[] { data });
+                        method.Invoke(texture, new object[] { il2cppArray });
+                        return true;
+                    }
+
+                    // Try with int length constructor + copy
+                    ctor = paramType.GetConstructor(new Type[] { typeof(int) });
+                    if (ctor != null)
+                    {
+                        var il2cppArray = ctor.Invoke(new object[] { data.Length });
+                        var indexer = paramType.GetProperty("Item");
+                        if (indexer != null)
+                        {
+                            for (int i = 0; i < data.Length; i++)
+                                indexer.SetValue(il2cppArray, data[i], new object[] { i });
+                            method.Invoke(texture, new object[] { il2cppArray });
+                            return true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    TranslatorCore.LogWarning($"[CustomFontLoader] LoadRawTextureData IL2CPP conversion failed: {ex.Message}");
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
