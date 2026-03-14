@@ -755,14 +755,43 @@ namespace UnityGameTranslator.Core
                 }
             }
 
-            // Try 2: Font() + Internal_CreateFont(Font, String) — IL2CPP internal API
+            // Try 2: Font() + Internal_CreateFontFromPath — load TTF from file path
+            try
+            {
+                var internalFromPath = fontType.GetMethod("Internal_CreateFontFromPath",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                if (internalFromPath != null)
+                {
+                    // Find the TTF file path
+                    string fontPath = FindFontFilePath(fontName);
+                    if (fontPath != null)
+                    {
+                        var emptyCtor = fontType.GetConstructor(Type.EmptyTypes);
+                        if (emptyCtor != null)
+                        {
+                            var font = emptyCtor.Invoke(null) as Font;
+                            if (font != null)
+                            {
+                                internalFromPath.Invoke(null, new object[] { font, fontPath });
+                                TranslatorCore.LogInfo($"[FontManager] Created Font via Internal_CreateFontFromPath: {fontPath}");
+                                return font;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogWarning($"[FontManager] Internal_CreateFontFromPath failed: {ex.InnerException?.Message ?? ex.Message}");
+            }
+
+            // Try 3: Font() + Internal_CreateFont(Font, String) — by name
             try
             {
                 var internalCreate = fontType.GetMethod("Internal_CreateFont",
                     System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
                 if (internalCreate != null)
                 {
-                    // Create empty Font first
                     var emptyCtor = fontType.GetConstructor(Type.EmptyTypes);
                     if (emptyCtor != null)
                     {
@@ -852,6 +881,71 @@ namespace UnityGameTranslator.Core
             catch { }
 
             TranslatorCore.LogWarning($"[FontManager] Cannot create Font on this runtime for: {fontName}");
+            return null;
+        }
+
+        /// <summary>
+        /// Find the TTF/OTF file path for a font name.
+        /// Scans Windows/Fonts, Linux/Mac font dirs.
+        /// </summary>
+        private static string FindFontFilePath(string fontName)
+        {
+            if (string.IsNullOrEmpty(fontName)) return null;
+
+            string[] fontDirs;
+            if (Application.platform == RuntimePlatform.WindowsPlayer || Application.platform == RuntimePlatform.WindowsEditor)
+            {
+                string winDir = System.Environment.GetEnvironmentVariable("WINDIR") ?? @"C:\Windows";
+                fontDirs = new[] { System.IO.Path.Combine(winDir, "Fonts") };
+            }
+            else if (Application.platform == RuntimePlatform.LinuxPlayer || Application.platform == RuntimePlatform.LinuxEditor)
+            {
+                fontDirs = new[] { "/usr/share/fonts", "/usr/local/share/fonts" };
+            }
+            else if (Application.platform == RuntimePlatform.OSXPlayer || Application.platform == RuntimePlatform.OSXEditor)
+            {
+                fontDirs = new[] { "/Library/Fonts", "/System/Library/Fonts" };
+            }
+            else
+            {
+                return null;
+            }
+
+            // Search for exact match first, then partial
+            foreach (var dir in fontDirs)
+            {
+                if (!System.IO.Directory.Exists(dir)) continue;
+                try
+                {
+                    // Exact filename match
+                    foreach (var ext in new[] { ".ttf", ".otf", ".TTF", ".OTF" })
+                    {
+                        string path = System.IO.Path.Combine(dir, fontName + ext);
+                        if (System.IO.File.Exists(path))
+                        {
+                            TranslatorCore.LogInfo($"[FontManager] Found font file: {path}");
+                            return path;
+                        }
+                    }
+
+                    // Search recursively
+                    foreach (var file in System.IO.Directory.GetFiles(dir, "*.*", System.IO.SearchOption.AllDirectories))
+                    {
+                        string fileName = System.IO.Path.GetFileNameWithoutExtension(file);
+                        string fileExt = System.IO.Path.GetExtension(file).ToLower();
+                        if (fileExt != ".ttf" && fileExt != ".otf") continue;
+
+                        if (string.Equals(fileName, fontName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            TranslatorCore.LogInfo($"[FontManager] Found font file: {file}");
+                            return file;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            TranslatorCore.LogWarning($"[FontManager] Font file not found for: {fontName}");
             return null;
         }
 
