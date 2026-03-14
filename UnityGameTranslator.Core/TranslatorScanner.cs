@@ -742,6 +742,10 @@ namespace UnityGameTranslator.Core
 
                 il2cppScanAvailable = il2cppTypeOfMethod != null && resourcesFindAllMethod != null;
 
+                // Share IL2CPP methods with TypeHelper for use by other components
+                if (il2cppScanAvailable)
+                    TypeHelper.SetIL2CPPMethods(il2cppTypeOfMethod, resourcesFindAllMethod);
+
                 // Pre-cache generic methods for TMP_Text and Text
                 // Use TypeHelper resolved types instead of compile-time typeof()
                 // This avoids TypeLoadException on IL2CPP where standard assemblies aren't compatible
@@ -894,58 +898,12 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Find all objects of a given type, using reflection to handle both Mono and IL2CPP.
-        /// On IL2CPP, FindObjectsOfType(Type) may not exist — uses Resources.FindObjectsOfTypeAll as fallback.
+        /// Find all objects of a given type.
+        /// Delegates to TypeHelper which handles both Mono and IL2CPP correctly.
         /// </summary>
         private static UnityEngine.Object[] FindAllObjectsOfType(Type type)
         {
-            if (type == null) return null;
-
-            // Try FindObjectsOfType with includeInactive parameter (Unity 2020+, Mono)
-            try
-            {
-                var method = typeof(UnityEngine.Object).GetMethod("FindObjectsOfType",
-                    BindingFlags.Public | BindingFlags.Static,
-                    null, new Type[] { typeof(Type), typeof(bool) }, null);
-                if (method != null)
-                {
-                    var result = method.Invoke(null, new object[] { type, true }) as UnityEngine.Object[];
-                    if (result != null) return result;
-                }
-            }
-            catch { }
-
-            // Try FindObjectsOfType(Type) without includeInactive
-            try
-            {
-                return UnityEngine.Object.FindObjectsOfType(type);
-            }
-            catch { }
-
-            // IL2CPP fallback: use Resources.FindObjectsOfTypeAll(Type)
-            // This finds ALL objects (including inactive/hidden) which is fine for scanning
-            try
-            {
-                var result = Resources.FindObjectsOfTypeAll(type);
-                if (result != null) return result;
-            }
-            catch { }
-
-            // IL2CPP fallback 2: use the IL2CPP-specific method if available
-            if (il2cppScanAvailable && il2cppTypeOfMethod != null && resourcesFindAllMethod != null)
-            {
-                try
-                {
-                    var il2cppType = il2cppTypeOfMethod.MakeGenericMethod(type).Invoke(null, null);
-                    if (il2cppType != null)
-                    {
-                        return FindAllComponentsIL2CPPCached(il2cppType);
-                    }
-                }
-                catch { }
-            }
-
-            return null;
+            return TypeHelper.FindAllObjectsOfType(type);
         }
 
         #endregion

@@ -504,7 +504,7 @@ namespace UnityGameTranslator.Core
             {
                 // Try to clone an existing font asset first (better initialization)
                 object fontAsset = null;
-                var existingFonts = FindObjectsOfTypeAllSafe(_tmpFontAssetType);
+                var existingFonts = TypeHelper.FindAllObjectsOfType(_tmpFontAssetType);
                 foreach (var existingFont in existingFonts)
                 {
                     if (existingFont != null && existingFont.name != "NotoSansDevanagari" && existingFont.name != "KrutiDev714Normal")
@@ -520,7 +520,7 @@ namespace UnityGameTranslator.Core
                 // Fallback to creating new instance if no font to clone
                 if (fontAsset == null)
                 {
-                    fontAsset = CreateScriptableObjectSafe(_tmpFontAssetType);
+                    fontAsset = TypeHelper.CreateScriptableObject(_tmpFontAssetType);
                     ((UnityEngine.Object)fontAsset).name = fontInfo.Name;
                     TranslatorCore.LogInfo("[CustomFontLoader] Created new font asset instance");
                 }
@@ -662,7 +662,7 @@ namespace UnityGameTranslator.Core
                 // First, try to find an existing TMP font and copy its material/shader
                 if (_tmpFontAssetType != null)
                 {
-                    var existingFonts = FindObjectsOfTypeAllSafe(_tmpFontAssetType);
+                    var existingFonts = TypeHelper.FindAllObjectsOfType(_tmpFontAssetType);
 
                     // Debug: dump structure of first existing font (not our custom ones)
                     if (!_existingFontDumped)

@@ -698,5 +698,138 @@ namespace UnityGameTranslator.Core
         }
 
         #endregion
+
+        #region IL2CPP Helpers
+
+        // Cached IL2CPP methods (populated by TranslatorScanner.InitializeIL2CPP or on first use)
+        private static MethodInfo _il2cppTypeOfMethod;
+        private static MethodInfo _il2cppResourcesFindAllMethod;
+        private static bool _il2cppHelpersInitialized;
+
+        /// <summary>
+        /// Initialize IL2CPP helper methods. Call from InitializeIL2CPP after methods are found.
+        /// </summary>
+        public static void SetIL2CPPMethods(MethodInfo il2cppTypeOfMethod, MethodInfo resourcesFindAllMethod)
+        {
+            _il2cppTypeOfMethod = il2cppTypeOfMethod;
+            _il2cppResourcesFindAllMethod = resourcesFindAllMethod;
+            _il2cppHelpersInitialized = true;
+        }
+
+        /// <summary>
+        /// Find all objects of a type, compatible with both Mono and IL2CPP.
+        /// On IL2CPP, uses Il2CppType.Of&lt;T&gt;() + Resources.FindObjectsOfTypeAll(Il2CppType)
+        /// which is the correct pattern per MelonLoader documentation.
+        /// </summary>
+        public static UnityEngine.Object[] FindAllObjectsOfType(Type type)
+        {
+            if (type == null) return new UnityEngine.Object[0];
+
+            // IL2CPP path: use Il2CppType.Of<T>() pattern
+            if (_il2cppHelpersInitialized && _il2cppTypeOfMethod != null && _il2cppResourcesFindAllMethod != null)
+            {
+                try
+                {
+                    var il2cppType = _il2cppTypeOfMethod.MakeGenericMethod(type).Invoke(null, null);
+                    if (il2cppType != null)
+                    {
+                        var result = _il2cppResourcesFindAllMethod.Invoke(null, new[] { il2cppType });
+                        if (result is UnityEngine.Object[] array)
+                            return array;
+
+                        // IL2CPP may return Il2CppReferenceArray — convert
+                        if (result is System.Collections.IEnumerable enumerable)
+                        {
+                            var list = new List<UnityEngine.Object>();
+                            foreach (var item in enumerable)
+                            {
+                                if (item is UnityEngine.Object uobj)
+                                    list.Add(uobj);
+                            }
+                            return list.ToArray();
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            // Mono path: direct call
+            try
+            {
+                var method = typeof(UnityEngine.Object).GetMethod("FindObjectsOfType",
+                    BindingFlags.Public | BindingFlags.Static,
+                    null, new Type[] { typeof(Type), typeof(bool) }, null);
+                if (method != null)
+                    return method.Invoke(null, new object[] { type, true }) as UnityEngine.Object[];
+            }
+            catch { }
+
+            try
+            {
+                return UnityEngine.Object.FindObjectsOfType(type);
+            }
+            catch { }
+
+            try
+            {
+                return Resources.FindObjectsOfTypeAll(type);
+            }
+            catch { }
+
+            return new UnityEngine.Object[0];
+        }
+
+        /// <summary>
+        /// Create a ScriptableObject of a given type, compatible with IL2CPP.
+        /// </summary>
+        public static UnityEngine.Object CreateScriptableObject(Type type)
+        {
+            if (type == null) return null;
+
+            // Try direct call
+            try
+            {
+                return ScriptableObject.CreateInstance(type);
+            }
+            catch { }
+
+            // IL2CPP: the generic version ScriptableObject.CreateInstance<T>() may work
+            try
+            {
+                var soType = typeof(ScriptableObject);
+                MethodInfo genericMethod = null;
+                foreach (var m in soType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                {
+                    if (m.Name == "CreateInstance" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0)
+                    {
+                        genericMethod = m;
+                        break;
+                    }
+                }
+
+                if (genericMethod != null)
+                {
+                    var specific = genericMethod.MakeGenericMethod(type);
+                    var result = specific.Invoke(null, null);
+                    if (result is UnityEngine.Object uobj)
+                        return uobj;
+                }
+            }
+            catch { }
+
+            // Try Activator as last resort
+            try
+            {
+                var obj = Activator.CreateInstance(type);
+                if (obj is UnityEngine.Object uobj)
+                    return uobj;
+            }
+            catch { }
+
+            TranslatorCore.LogWarning($"[TypeHelper] Cannot create ScriptableObject of type {type.Name}");
+            return null;
+        }
+
+        #endregion
     }
 }
