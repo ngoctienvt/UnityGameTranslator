@@ -185,9 +185,9 @@ namespace UnityGameTranslator.Core
                             // Check both current font name AND original font name (in case font was replaced)
                             string compFontName = TypeHelper.GetFontName(obj);
                             string origFontName = FontManager.GetOriginalFontName(instanceId);
-                            bool shouldRestore = globalRestore
-                                || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName))
-                                || (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName));
+                            bool fontDisabled = (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName))
+                                || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
+                            bool shouldRestore = globalRestore || fontDisabled;
                             if (shouldRestore)
                             {
                                 // Try to restore original text and font
@@ -229,9 +229,9 @@ namespace UnityGameTranslator.Core
                             // Check both current font name AND original font name (in case font was replaced)
                             string compFontName = TypeHelper.GetFontName(obj);
                             string origFontName = FontManager.GetOriginalFontName(instanceId);
-                            bool shouldRestore = globalRestore
-                                || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName))
-                                || (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName));
+                            bool fontDisabled = (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName))
+                                || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
+                            bool shouldRestore = globalRestore || fontDisabled;
                             if (shouldRestore)
                             {
                                 string original = GetOriginalText(instanceId);
