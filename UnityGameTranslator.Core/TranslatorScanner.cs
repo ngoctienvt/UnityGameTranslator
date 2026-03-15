@@ -751,23 +751,13 @@ namespace UnityGameTranslator.Core
             {
                 ForceRefreshCache();
 
-                if (cachedTMPMono != null)
-                {
-                    foreach (var obj in cachedTMPMono)
-                    {
-                        if (obj == null) continue;
-                        try { HighlightComponent(obj, fontName); } catch { }
-                    }
-                }
+                // Mono caches
+                HighlightCache(cachedTMPMono, fontName);
+                HighlightCache(cachedUIMono, fontName);
 
-                if (cachedUIMono != null)
-                {
-                    foreach (var obj in cachedUIMono)
-                    {
-                        if (obj == null) continue;
-                        try { HighlightComponent(obj, fontName); } catch { }
-                    }
-                }
+                // IL2CPP caches (need casting to get font info)
+                HighlightIL2CPPCache(cachedTMPComponents, tryCastTMPMethod, fontName);
+                HighlightIL2CPPCache(cachedUIComponents, tryCastTextMethod, fontName);
             }
             catch (Exception ex)
             {
@@ -784,24 +774,11 @@ namespace UnityGameTranslator.Core
 
             try
             {
-                // Restore all cached original colors
-                if (cachedTMPMono != null)
-                {
-                    foreach (var obj in cachedTMPMono)
-                    {
-                        if (obj == null) continue;
-                        try { RestoreComponentColor(obj); } catch { }
-                    }
-                }
-
-                if (cachedUIMono != null)
-                {
-                    foreach (var obj in cachedUIMono)
-                    {
-                        if (obj == null) continue;
-                        try { RestoreComponentColor(obj); } catch { }
-                    }
-                }
+                // Restore all caches
+                RestoreCache(cachedTMPMono);
+                RestoreCache(cachedUIMono);
+                RestoreIL2CPPCache(cachedTMPComponents, tryCastTMPMethod);
+                RestoreIL2CPPCache(cachedUIComponents, tryCastTextMethod);
             }
             catch { }
 
@@ -809,31 +786,94 @@ namespace UnityGameTranslator.Core
             _highlightedFontName = null;
         }
 
-        private static void HighlightComponent(UnityEngine.Object obj, string targetFontName)
+        private static void HighlightCache(UnityEngine.Object[] cache, string targetFontName)
         {
-            int id = obj.GetInstanceID();
+            if (cache == null) return;
+            foreach (var obj in cache)
+            {
+                if (obj == null) continue;
+                try { HighlightComponent(obj, obj.GetInstanceID(), targetFontName); } catch { }
+            }
+        }
+
+        private static void HighlightIL2CPPCache(UnityEngine.Object[] cache, MethodInfo tryCastMethod, string targetFontName)
+        {
+            if (cache == null || tryCastMethod == null) return;
+            foreach (var obj in cache)
+            {
+                if (obj == null) continue;
+                try
+                {
+                    object component = tryCastMethod.IsStatic
+                        ? tryCastMethod.Invoke(null, new object[] { obj })
+                        : tryCastMethod.Invoke(obj, null);
+                    if (component == null) continue;
+
+                    int id = TypeHelper.GetInstanceID(component);
+                    if (id == -1) continue;
+                    HighlightComponent(component, id, targetFontName);
+                }
+                catch { }
+            }
+        }
+
+        private static void RestoreCache(UnityEngine.Object[] cache)
+        {
+            if (cache == null) return;
+            foreach (var obj in cache)
+            {
+                if (obj == null) continue;
+                try { RestoreComponentColor(obj, obj.GetInstanceID()); } catch { }
+            }
+        }
+
+        private static void RestoreIL2CPPCache(UnityEngine.Object[] cache, MethodInfo tryCastMethod)
+        {
+            if (cache == null || tryCastMethod == null) return;
+            foreach (var obj in cache)
+            {
+                if (obj == null) continue;
+                try
+                {
+                    object component = tryCastMethod.IsStatic
+                        ? tryCastMethod.Invoke(null, new object[] { obj })
+                        : tryCastMethod.Invoke(obj, null);
+                    if (component == null) continue;
+
+                    int id = TypeHelper.GetInstanceID(component);
+                    if (id == -1) continue;
+                    RestoreComponentColor(component, id);
+                }
+                catch { }
+            }
+        }
+
+        private static void HighlightComponent(object component, int id, string targetFontName)
+        {
+            // Skip our own UI components
+            var comp = component as Component;
+            if (comp != null && TranslatorCore.ShouldSkipTranslation(comp)) return;
 
             // Determine if this component's font matches (check both current and original name)
-            string compFont = TypeHelper.GetFontName(obj);
+            string compFont = TypeHelper.GetFontName(component);
             string origFont = FontManager.GetOriginalFontName(id);
             bool matches = (!string.IsNullOrEmpty(compFont) && string.Equals(compFont, targetFontName, StringComparison.OrdinalIgnoreCase))
                 || (!string.IsNullOrEmpty(origFont) && string.Equals(origFont, targetFontName, StringComparison.OrdinalIgnoreCase));
 
             // Store original color
-            Color originalColor = TypeHelper.GetTextColor(obj);
+            Color originalColor = TypeHelper.GetTextColor(component);
             if (!_highlightOriginalColors.ContainsKey(id))
                 _highlightOriginalColors[id] = originalColor;
 
             // Apply highlight or dim
-            TypeHelper.SetTextColor(obj, matches ? HighlightColor : DimColor);
+            TypeHelper.SetTextColor(component, matches ? HighlightColor : DimColor);
         }
 
-        private static void RestoreComponentColor(UnityEngine.Object obj)
+        private static void RestoreComponentColor(object component, int id)
         {
-            int id = obj.GetInstanceID();
             if (_highlightOriginalColors.TryGetValue(id, out var originalColor))
             {
-                TypeHelper.SetTextColor(obj, originalColor);
+                TypeHelper.SetTextColor(component, originalColor);
             }
         }
 
