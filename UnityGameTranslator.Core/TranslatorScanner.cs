@@ -990,11 +990,9 @@ namespace UnityGameTranslator.Core
                 int instanceId = TypeHelper.GetInstanceID(component);
                 if (instanceId == -1) return;
 
-                // Check per-font translation state
+                // Check per-font translation state (always uses original font name for settings)
                 string compFontName = GetFontNameForType(component, type);
-                string origFontName = FontManager.GetOriginalFontName(instanceId);
-                bool fontDisabled = (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName))
-                    || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
+                bool fontDisabled = !FontManager.IsTranslationEnabledForComponent(instanceId, compFontName);
                 bool shouldRestore = globalRestore || fontDisabled;
 
                 if (shouldRestore)
@@ -1151,12 +1149,9 @@ namespace UnityGameTranslator.Core
                 int id = TypeHelper.GetInstanceID(component);
                 if (id == -1) return 0;
 
-                // Match against both current font name AND tracked original font name
+                // Match by both current and original font name
                 string compFont = GetFontNameForType(component, type);
-                string origFont = FontManager.GetOriginalFontName(id);
-                bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
-                    || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
-                if (!matches) return 0;
+                if (!FontManager.ComponentMatchesFont(id, compFont, fontNames)) return 0;
 
                 // Restore font before text
                 if (type.Category == "TMP" || type.Category == "Unity" || type.Category == "TextMesh")
@@ -1226,10 +1221,7 @@ namespace UnityGameTranslator.Core
                 if (id == -1) return 0;
 
                 string compFont = GetFontNameForType(component, type);
-                string origFont = FontManager.GetOriginalFontName(id);
-                bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
-                    || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
-                if (!matches) return 0;
+                if (!FontManager.ComponentMatchesFont(id, compFont, fontNames)) return 0;
 
                 processedTextHashes.Remove(id);
 
@@ -1351,11 +1343,10 @@ namespace UnityGameTranslator.Core
             var comp = component as Component;
             if (comp != null && TranslatorCore.ShouldSkipTranslation(comp)) return;
 
-            // Determine if this component's font matches (check both current and original name)
+            // Match by settings font name (always the original, not the replacement)
             string compFont = TypeHelper.GetFontName(component);
-            string origFont = FontManager.GetOriginalFontName(id);
-            bool matches = (!string.IsNullOrEmpty(compFont) && string.Equals(compFont, targetFontName, StringComparison.OrdinalIgnoreCase))
-                || (!string.IsNullOrEmpty(origFont) && string.Equals(origFont, targetFontName, StringComparison.OrdinalIgnoreCase));
+            string settingsFont = FontManager.GetSettingsFontName(id, compFont);
+            bool matches = !string.IsNullOrEmpty(settingsFont) && string.Equals(settingsFont, targetFontName, StringComparison.OrdinalIgnoreCase);
 
             // Store original color
             Color originalColor = TypeHelper.GetTextColor(component);

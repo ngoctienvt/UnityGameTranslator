@@ -682,6 +682,42 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
+        /// Get the SETTINGS font name for a component — always the ORIGINAL font name,
+        /// never the replacement. This is THE method to use for all settings lookups
+        /// (enable/disable, fallback, scale, font matching).
+        ///
+        /// Rule: the source font name is immutable for settings purposes.
+        /// When a font is replaced, the replacement is visual only — all settings
+        /// operations must reference the original game font.
+        /// </summary>
+        /// <param name="instanceId">Component instance ID</param>
+        /// <param name="currentFontName">Current font name on the component (may be replacement)</param>
+        /// <returns>Original font name if tracked, otherwise currentFontName</returns>
+        public static string GetSettingsFontName(int instanceId, string currentFontName)
+        {
+            return GetOriginalFontName(instanceId) ?? currentFontName;
+        }
+
+        /// <summary>
+        /// Check if a component's font matches a set of font names (for refresh/restore operations).
+        /// Checks BOTH the current font name AND the tracked original font name.
+        /// </summary>
+        public static bool ComponentMatchesFont(int instanceId, string currentFontName, HashSet<string> fontNames)
+        {
+            return (!string.IsNullOrEmpty(currentFontName) && fontNames.Contains(currentFontName))
+                || (!string.IsNullOrEmpty(GetOriginalFontName(instanceId)) && fontNames.Contains(GetOriginalFontName(instanceId)));
+        }
+
+        /// <summary>
+        /// Check if translation is enabled for a component, using the correct (original) font name.
+        /// </summary>
+        public static bool IsTranslationEnabledForComponent(int instanceId, string currentFontName)
+        {
+            string settingsName = GetSettingsFontName(instanceId, currentFontName);
+            return string.IsNullOrEmpty(settingsName) || IsTranslationEnabled(settingsName);
+        }
+
+        /// <summary>
         /// Check if fallback was successfully applied for a font.
         /// </summary>
         public static bool IsFallbackApplied(string fontName)

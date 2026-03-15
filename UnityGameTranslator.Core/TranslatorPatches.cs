@@ -465,7 +465,7 @@ namespace UnityGameTranslator.Core
                         {
                             fontName = uobj.name;
                             int compId = component.GetInstanceID();
-                            settingsFontName = FontManager.GetOriginalFontName(compId) ?? fontName;
+                            settingsFontName = FontManager.GetSettingsFontName(compId, fontName);
 
                             FontManager.RegisterFontByName(settingsFontName, typeInfo.FontTypeName);
                             FontManager.IncrementUsageCount(settingsFontName);
@@ -513,7 +513,7 @@ namespace UnityGameTranslator.Core
                         if (fontObj is UnityEngine.Object uobj && !string.IsNullOrEmpty(uobj.name))
                         {
                             int compId = component.GetInstanceID();
-                            string settingsFontName = FontManager.GetOriginalFontName(compId) ?? uobj.name;
+                            string settingsFontName = FontManager.GetSettingsFontName(compId, uobj.name);
                             FontManager.RegisterFontByName(settingsFontName, typeInfo.FontTypeName);
                             if (!FontManager.IsTranslationEnabled(settingsFontName))
                                 return;
@@ -1574,7 +1574,7 @@ namespace UnityGameTranslator.Core
                     {
                         // Check if this is a replaced font — use original name for settings
                         int compId = TypeHelper.GetInstanceID(__instance);
-                        settingsFontName = FontManager.GetOriginalFontName(compId) ?? fontName;
+                        settingsFontName = FontManager.GetSettingsFontName(compId, fontName);
 
                         FontManager.RegisterFontByName(settingsFontName, componentType);
                         FontManager.IncrementUsageCount(settingsFontName);
