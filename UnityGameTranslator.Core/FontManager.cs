@@ -513,6 +513,88 @@ namespace UnityGameTranslator.Core
         /// Does NOT replace the font on the component. TMP uses fallback fonts automatically
         /// for characters not found in the primary font.
         /// </summary>
+        // Track original fonts per component instance ID (for restore on toggle)
+        private static readonly Dictionary<int, object> _originalFontsPerComponent = new Dictionary<int, object>();
+
+        /// <summary>
+        /// Apply font replacement: SetFont to the replacement, add original as fallback.
+        /// Stores original font for runtime restore.
+        /// </summary>
+        public static void ApplyFontReplacement(object component, object originalFontObj, string originalFontName)
+        {
+            if (component == null || string.IsNullOrEmpty(originalFontName)) return;
+
+            var replacementFont = GetTMPReplacementFont(originalFontName);
+            if (replacementFont == null) return;
+
+            // Don't re-apply if already replaced with the right font
+            string currentFontName = TypeHelper.GetFontName(component);
+            string replacementName = (replacementFont is UnityEngine.Object rObj) ? rObj.name : null;
+            if (currentFontName == replacementName) return;
+
+            // Store original font for this component (for restore)
+            int instanceId = TypeHelper.GetInstanceID(component);
+            if (instanceId != -1 && !_originalFontsPerComponent.ContainsKey(instanceId))
+            {
+                _originalFontsPerComponent[instanceId] = originalFontObj;
+            }
+
+            // SetFont to replacement
+            TypeHelper.SetFont(component, replacementFont);
+
+            // Add original game font as fallback on the replacement font
+            // So missing chars in replacement → fall back to original
+            if (originalFontObj != null && !_fallbackAppliedFonts.Contains(originalFontName + "_reverse"))
+            {
+                var fallbackList = GetFallbackListReflection(replacementFont);
+                if (fallbackList != null)
+                {
+                    var addMethod = fallbackList.GetType().GetMethod("Add");
+                    if (addMethod != null)
+                    {
+                        try
+                        {
+                            // Cast original font for IL2CPP compatibility
+                            var castedOriginal = TypeHelper.Il2CppCast(originalFontObj,
+                                TypeHelper.TMP_FontAssetType ?? originalFontObj.GetType());
+                            addMethod.Invoke(fallbackList, new[] { castedOriginal });
+                            _fallbackAppliedFonts.Add(originalFontName + "_reverse");
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Restore original font on a component. Called when translation is disabled.
+        /// </summary>
+        public static void RestoreOriginalFont(object component)
+        {
+            if (component == null) return;
+            int instanceId = TypeHelper.GetInstanceID(component);
+            if (instanceId == -1) return;
+
+            if (_originalFontsPerComponent.TryGetValue(instanceId, out var originalFont))
+            {
+                TypeHelper.SetFont(component, originalFont);
+                _originalFontsPerComponent.Remove(instanceId);
+            }
+        }
+
+        /// <summary>
+        /// Get the original font name for a component (before replacement).
+        /// Returns null if not tracked.
+        /// </summary>
+        public static string GetOriginalFontName(int instanceId)
+        {
+            if (_originalFontsPerComponent.TryGetValue(instanceId, out var fontObj))
+            {
+                return (fontObj is UnityEngine.Object uobj) ? uobj.name : null;
+            }
+            return null;
+        }
+
         /// <summary>
         /// Check if fallback was successfully applied for a font.
         /// </summary>

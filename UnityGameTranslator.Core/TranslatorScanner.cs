@@ -182,14 +182,19 @@ namespace UnityGameTranslator.Core
                             int instanceId = obj.GetInstanceID();
 
                             // Restore if global translations disabled OR per-font disabled
+                            // Check both current font name AND original font name (in case font was replaced)
                             string compFontName = TypeHelper.GetFontName(obj);
-                            bool shouldRestore = globalRestore || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
+                            string origFontName = FontManager.GetOriginalFontName(instanceId);
+                            bool shouldRestore = globalRestore
+                                || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName))
+                                || (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName));
                             if (shouldRestore)
                             {
-                                // Try to restore original if we have it
+                                // Try to restore original text and font
                                 string original = GetOriginalText(instanceId);
                                 if (original != null)
                                 {
+                                    FontManager.RestoreOriginalFont(obj);
                                     TypeHelper.SetText(obj, original);
                                     ClearOriginalText(instanceId);
                                     processedTextHashes.Remove(instanceId);
@@ -221,8 +226,12 @@ namespace UnityGameTranslator.Core
                             int instanceId = obj.GetInstanceID();
 
                             // Restore if global translations disabled OR per-font disabled
+                            // Check both current font name AND original font name (in case font was replaced)
                             string compFontName = TypeHelper.GetFontName(obj);
-                            bool shouldRestore = globalRestore || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
+                            string origFontName = FontManager.GetOriginalFontName(instanceId);
+                            bool shouldRestore = globalRestore
+                                || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName))
+                                || (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName));
                             if (shouldRestore)
                             {
                                 string original = GetOriginalText(instanceId);

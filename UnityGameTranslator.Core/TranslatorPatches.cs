@@ -1146,6 +1146,7 @@ namespace UnityGameTranslator.Core
                 if (TranslatorCore.ShouldSkipTranslation(comp)) return;
 
                 string fontName = null;
+                string settingsFontName = null;
 
                 // Register font for fallback management
                 object fontObj = TypeHelper.GetFont(__instance);
@@ -1154,47 +1155,23 @@ namespace UnityGameTranslator.Core
                     fontName = (fontObj is UnityEngine.Object uobj) ? uobj.name : null;
                     if (!string.IsNullOrEmpty(fontName))
                     {
-                        FontManager.RegisterFontByName(fontName, componentType);
-                        FontManager.IncrementUsageCount(fontName);
+                        // Check if this is a replaced font — use original name for settings
+                        int compId = TypeHelper.GetInstanceID(__instance);
+                        settingsFontName = FontManager.GetOriginalFontName(compId) ?? fontName;
+
+                        FontManager.RegisterFontByName(settingsFontName, componentType);
+                        FontManager.IncrementUsageCount(settingsFontName);
 
                         // Skip translation if disabled for this font
-                        if (!FontManager.IsTranslationEnabled(fontName))
+                        if (!FontManager.IsTranslationEnabled(settingsFontName))
                             return;
 
-                        // Apply fallback font if configured
+                        // Apply replacement font: SetFont to custom/system font,
+                        // add original game font as fallback on the replacement
+                        // (so missing chars fall back to original, not the other way)
                         if (componentType == "TMP")
                         {
-                            // TMProOld (UseAlternateTMP) doesn't support fallback fonts —
-                            // use direct SetFont replacement like before
-                            if (TypeHelper.UseAlternateTMP)
-                            {
-                                var replacementFont = FontManager.GetTMPReplacementFont(fontName);
-                                if (replacementFont != null)
-                                {
-                                    // Verify font before/after
-                                    string beforeFont = TypeHelper.GetFontName(__instance);
-                                    TypeHelper.SetFont(__instance, replacementFont);
-                                    string afterFont = TypeHelper.GetFontName(__instance);
-                                    if (beforeFont != afterFont)
-                                    {
-                                        if (!s_altFontChangeLogged)
-                                        {
-                                            s_altFontChangeLogged = true;
-                                            TranslatorCore.LogInfo($"[Patches] TMProOld SetFont: {beforeFont} -> {afterFont}");
-                                        }
-                                    }
-                                    else if (!s_altFontChangeLogged)
-                                    {
-                                        s_altFontChangeLogged = true;
-                                        TranslatorCore.LogWarning($"[Patches] TMProOld SetFont FAILED: font still {beforeFont}, replacement type={replacementFont?.GetType().Name}");
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                // Modern TMP: prefer fallback approach (keeps original font)
-                                FontManager.EnsureFallbackApplied(fontObj, fontName);
-                            }
+                            FontManager.ApplyFontReplacement(__instance, fontObj, settingsFontName);
                         }
                         else if (componentType == "Unity")
                         {
@@ -1214,7 +1191,7 @@ namespace UnityGameTranslator.Core
                 textValue = TranslatorCore.TranslateTextWithTracking(textValue, comp, isOwnUI);
 
                 // Apply font scale if configured for this font
-                ApplyFontScale(__instance, fontName);
+                ApplyFontScale(__instance, settingsFontName ?? fontName);
             }
             catch (Exception ex)
             {
