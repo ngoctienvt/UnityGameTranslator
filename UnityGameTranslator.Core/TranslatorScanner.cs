@@ -28,6 +28,24 @@ namespace UnityGameTranslator.Core
         private static bool _typesRegistered = false;
 
         /// <summary>
+        /// Find a component by instance ID across all registered type caches.
+        /// Used by FontManager for font restore operations.
+        /// </summary>
+        public static object FindCachedComponentById(int instanceId)
+        {
+            foreach (var type in _registeredTypes)
+            {
+                if (type.CachedComponents == null) continue;
+                foreach (var obj in type.CachedComponents)
+                {
+                    if (obj != null && obj.GetInstanceID() == instanceId)
+                        return obj;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
         /// Register a type for scanning. Called by RegisterBuiltInTypes and TranslatorPatches.
         /// </summary>
         public static void RegisterType(RegisteredTextType type)

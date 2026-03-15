@@ -490,35 +490,8 @@ namespace UnityGameTranslator.Core
         /// </summary>
         private static object FindComponentByInstanceId(int instanceId)
         {
-            // Search through all objects of the TMP type
-            if (TypeHelper.TMP_TextType != null)
-            {
-                try
-                {
-                    var allTMP = Resources.FindObjectsOfTypeAll(TypeHelper.TMP_TextType);
-                    foreach (var obj in allTMP)
-                    {
-                        if (obj != null && obj.GetInstanceID() == instanceId)
-                            return obj;
-                    }
-                }
-                catch { }
-            }
-
-            // Search through UI.Text
-            if (TypeHelper.UI_TextType != null)
-            {
-                try
-                {
-                    var allUI = Resources.FindObjectsOfTypeAll(TypeHelper.UI_TextType);
-                    foreach (var obj in allUI)
-                    {
-                        if (obj != null && obj.GetInstanceID() == instanceId)
-                            return obj;
-                    }
-                }
-                catch { }
-            }
+            // Use the scanner's unified cache (covers all registered types, works on IL2CPP)
+            return TranslatorScanner.FindCachedComponentById(instanceId);
 
             return null;
         }
