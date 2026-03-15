@@ -470,6 +470,44 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
+        /// Get the text color from a TMP or UI.Text component.
+        /// </summary>
+        public static Color GetTextColor(object component)
+        {
+            if (component == null) return Color.white;
+            try
+            {
+                var type = component.GetType();
+                var colorProp = type.GetProperty("color", BindingFlags.Public | BindingFlags.Instance);
+                if (colorProp != null && colorProp.CanRead)
+                {
+                    var val = colorProp.GetValue(component, null);
+                    if (val is Color c) return c;
+                }
+            }
+            catch { }
+            return Color.white;
+        }
+
+        /// <summary>
+        /// Set the text color on a TMP or UI.Text component.
+        /// </summary>
+        public static void SetTextColor(object component, Color color)
+        {
+            if (component == null) return;
+            try
+            {
+                var type = component.GetType();
+                var colorProp = type.GetProperty("color", BindingFlags.Public | BindingFlags.Instance);
+                if (colorProp != null && colorProp.CanWrite)
+                {
+                    colorProp.SetValue(component, color, null);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// Get the text value from a component.
         /// </summary>
         public static string GetText(object component)

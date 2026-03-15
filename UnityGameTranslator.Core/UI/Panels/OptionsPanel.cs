@@ -209,6 +209,16 @@ namespace UnityGameTranslator.Core.UI.Panels
             CreateExclusionsTabContent(exclusionsTab);
             CreateOnlineTabContent(onlineTab);
 
+            // Clear font highlight when leaving the Fonts tab
+            _tabBar.OnTabChanged += (index, name) =>
+            {
+                if (name != "Fonts")
+                {
+                    TranslatorScanner.ClearHighlight();
+                    ResetHighlightButton();
+                }
+            };
+
             // Tab height will be fixed on first display (see SetActive)
 
             // Buttons - in fixed footer (outside scroll)
@@ -610,6 +620,18 @@ namespace UnityGameTranslator.Core.UI.Panels
             TranslatorCore.LogInfo($"[OptionsPanel] Adding toggle listener for font: {capturedFontName}");
             UIHelpers.AddToggleListener(enableToggle, (isOn) => OnFontEnableChanged(capturedFontName, isOn));
 
+            // Identify button: highlight in-game texts using this font
+            var identifyBtn = UIFactory.CreateButton(headerRow, "IdentifyBtn", "?");
+            UIFactory.SetLayoutElement(identifyBtn.GameObject, minWidth: 28, minHeight: 22);
+            identifyBtn.ButtonText.fontSize = UIStyles.FontSizeSmall;
+            identifyBtn.ButtonText.color = UIStyles.TextSecondary;
+            var identifyBg = identifyBtn.GameObject.GetComponent<Image>();
+            if (identifyBg != null)
+            {
+                identifyBg.color = UIStyles.ButtonSecondary;
+            }
+            identifyBtn.OnClick += () => ToggleFontHighlight(capturedFontName, identifyBtn);
+
             // Fallback row (only for fonts that support it)
             if (fontInfo.SupportsFallback)
             {
@@ -806,6 +828,52 @@ namespace UnityGameTranslator.Core.UI.Panels
                     return _scaleValues[i];
             }
             return 1.0f; // Default to 100%
+        }
+
+        // Track the currently highlighted font and its button for visual feedback
+        private string _highlightedFontName = null;
+        private ButtonRef _highlightedButton = null;
+
+        /// <summary>
+        /// Toggle font highlight: click to show, click again (or click another) to clear.
+        /// </summary>
+        private void ToggleFontHighlight(string fontName, ButtonRef button)
+        {
+            if (_highlightedFontName == fontName)
+            {
+                // Same font clicked again — clear highlight
+                TranslatorScanner.ClearHighlight();
+                ResetHighlightButton();
+            }
+            else
+            {
+                // Different font or first click — highlight this one
+                TranslatorScanner.ClearHighlight();
+                ResetHighlightButton();
+
+                TranslatorScanner.HighlightFont(fontName);
+                _highlightedFontName = fontName;
+                _highlightedButton = button;
+
+                // Visual feedback: active state on button
+                button.ButtonText.text = "X";
+                button.ButtonText.color = UIStyles.TextPrimary;
+                var bg = button.GameObject.GetComponent<Image>();
+                if (bg != null) bg.color = UIStyles.TextAccent;
+            }
+        }
+
+        private void ResetHighlightButton()
+        {
+            if (_highlightedButton != null)
+            {
+                _highlightedButton.ButtonText.text = "?";
+                _highlightedButton.ButtonText.color = UIStyles.TextSecondary;
+                var bg = _highlightedButton.GameObject.GetComponent<Image>();
+                if (bg != null) bg.color = UIStyles.ButtonSecondary;
+            }
+            _highlightedFontName = null;
+            _highlightedButton = null;
         }
 
         private void OnFontEnableChanged(string fontName, bool enabled)
@@ -1226,6 +1294,12 @@ namespace UnityGameTranslator.Core.UI.Panels
                 {
                     UniverseLib.RuntimeHelper.StartCoroutine(DelayedFixTabHeight());
                 }
+            }
+            else if (!active && wasActive)
+            {
+                // Clear font highlight when closing the panel
+                TranslatorScanner.ClearHighlight();
+                ResetHighlightButton();
             }
         }
 

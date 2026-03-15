@@ -18,7 +18,6 @@ namespace UnityGameTranslator.Core
         // Cache for original font sizes (instance ID -> original fontSize)
         // Used to apply scale without cumulative errors
         private static readonly Dictionary<int, float> _originalFontSizes = new Dictionary<int, float>();
-        private static bool s_altFontChangeLogged = false;
 
         // Types to exclude (known non-text types)
         private static readonly HashSet<string> ExcludedTypeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -953,6 +952,7 @@ namespace UnityGameTranslator.Core
         public static void ClearFontSizeCache()
         {
             _originalFontSizes.Clear();
+            _alternateTMPOriginalSizes.Clear();
         }
 
         /// <summary>
@@ -1115,18 +1115,14 @@ namespace UnityGameTranslator.Core
             {
                 float currentSize = TypeHelper.GetFontSize(instance);
                 if (currentSize >= 0 && Math.Abs(currentSize - originalSize) > 0.1f)
-                {
                     TypeHelper.SetFontSize(instance, originalSize);
-                }
                 return;
             }
 
             float scaledSize = originalSize * scale;
             float currentSize2 = TypeHelper.GetFontSize(instance);
             if (currentSize2 >= 0 && Math.Abs(currentSize2 - scaledSize) > 0.1f)
-            {
                 TypeHelper.SetFontSize(instance, scaledSize);
-            }
         }
 
         /// <summary>
@@ -1422,15 +1418,12 @@ namespace UnityGameTranslator.Core
         {
             if (instance == null || string.IsNullOrEmpty(originalFontName)) return;
 
-            TranslatorCore.LogInfo($"[AlternateTMP] TryApply called for font '{originalFontName}'");
-
             try
             {
                 var type = instance.GetType();
 
                 // Apply font scale if configured
                 float scale = FontManager.GetFontScale(originalFontName);
-                TranslatorCore.LogInfo($"[AlternateTMP] Scale for '{originalFontName}': {scale}");
                 if (Math.Abs(scale - 1.0f) > 0.01f)
                 {
                     // Try to apply scale via fontSize property
@@ -1441,15 +1434,14 @@ namespace UnityGameTranslator.Core
                         if (currentSize is float floatSize)
                         {
                             // Store original size to avoid compounding scale
-                            string instanceId = instance.GetHashCode().ToString();
-                            if (!_alternateTMPOriginalSizes.TryGetValue(instanceId, out float originalSize))
+                            string instanceKey = TypeHelper.GetInstanceID(instance).ToString();
+                            if (!_alternateTMPOriginalSizes.TryGetValue(instanceKey, out float originalSize))
                             {
                                 originalSize = floatSize;
-                                _alternateTMPOriginalSizes[instanceId] = originalSize;
+                                _alternateTMPOriginalSizes[instanceKey] = originalSize;
                             }
                             float newSize = originalSize * scale;
                             fontSizeProp.SetValue(instance, newSize, null);
-                            TranslatorCore.LogInfo($"[AlternateTMP] Applied scale {scale}: {originalSize} -> {newSize}");
                         }
                     }
                     else
@@ -1484,132 +1476,99 @@ namespace UnityGameTranslator.Core
                     return;
                 }
 
-                // Check if it's a custom font (from fonts/ folder)
+                // Get current (original) font before replacement
+                var originalFont = fontProp.GetValue(instance, null);
+
+                // Resolve the replacement font asset
+                object replacementAsset = null;
+
                 if (FontManager.IsCustomFont(fallbackName))
                 {
-                    // Strip [Custom] prefix if present
                     string customFontName = fallbackName;
                     if (fallbackName.StartsWith("[Custom] "))
                         customFontName = fallbackName.Substring(9);
 
-                    // DEBUG TEST: Try using an existing game font instead of custom font
-                    // This will tell us if the replacement mechanism works at all
-                    bool testWithExistingFont = false; // Set to true to test with ARIAL SDF
-                    if (testWithExistingFont && _alternateTMPFontCache.TryGetValue("ARIAL SDF", out object testFont))
-                    {
-                        fontProp.SetValue(instance, testFont, null);
-                        TranslatorCore.LogInfo($"[AlternateTMP] DEBUG: Using existing ARIAL SDF for testing");
-                        return;
-                    }
-
-                    var customFontAsset = CustomFontLoader.LoadCustomFont(customFontName);
-                    if (customFontAsset != null)
-                    {
-                        // DEBUG TEST: Force direct replacement to test if our custom font works
-                        // If this shows Hindi text, the problem is with the fallback system
-                        // If still empty, the problem is with our custom font rendering
-                        bool useDirectReplacement = true; // TODO: Change to false after testing
-
-                        if (!useDirectReplacement)
-                        {
-                            // Get current font and add custom font as fallback instead of replacing
-                            var currentFont = fontProp.GetValue(instance, null);
-                            if (currentFont != null)
-                            {
-                                // Try to add as fallback font (TMP will auto-use for missing glyphs)
-                                bool addedAsFallback = TryAddFallbackFont(currentFont, customFontAsset);
-                                if (addedAsFallback)
-                                {
-                                    TranslatorCore.LogInfo($"[AlternateTMP] Added '{customFontName}' as fallback font");
-                                    return;
-                                }
-                            }
-                        }
-
-                        // Replace the font directly
-                        fontProp.SetValue(instance, customFontAsset, null);
-
-                        if (TranslatorCore.Config.debug_ai)
-                        {
-                            var comp = instance as Component;
-                            string compInfo = comp != null ? $"{comp.GetType().Name} on '{comp.gameObject.name}'" : instance.GetType().Name;
-                            TranslatorCore.LogInfo($"[AlternateTMP] Applied custom font '{customFontName}' to {compInfo}");
-                        }
-
-                        // Also set the material to match the font's material
-                        try
-                        {
-                            var materialField = customFontAsset.GetType().GetField("material", BindingFlags.Public | BindingFlags.Instance);
-                            if (materialField != null)
-                            {
-                                var fontMaterial = materialField.GetValue(customFontAsset) as Material;
-                                if (fontMaterial != null)
-                                {
-                                    var fontSharedMatProp = instance.GetType().GetProperty("fontSharedMaterial", BindingFlags.Public | BindingFlags.Instance);
-                                    if (fontSharedMatProp != null && fontSharedMatProp.CanWrite)
-                                    {
-                                        fontSharedMatProp.SetValue(instance, fontMaterial, null);
-                                    }
-                                }
-                            }
-                        }
-                        catch (Exception matEx)
-                        {
-                            TranslatorCore.LogWarning($"[AlternateTMP] Could not set material: {matEx.Message}");
-                        }
-
-                        // Force mesh regeneration after font change
-                        try
-                        {
-                            var forceMeshUpdate = instance.GetType().GetMethod("ForceMeshUpdate",
-                                BindingFlags.Public | BindingFlags.Instance,
-                                null, Type.EmptyTypes, null);
-                            if (forceMeshUpdate != null)
-                            {
-                                forceMeshUpdate.Invoke(instance, null);
-                            }
-                        }
-                        catch (Exception)
-                        {
-                            // Expected for components not fully initialized yet.
-                            // The mesh will be regenerated when set_text runs after our prefix completes.
-                        }
-
-                        // Verbose debug diagnostics (font type, mesh state, glyph checks)
-                        if (TranslatorCore.Config.debug_ai)
-                        {
-                            LogFontDebugDiagnostics(instance, customFontAsset, customFontName);
-                        }
-                        return;
-                    }
-                    else
+                    replacementAsset = CustomFontLoader.LoadCustomFont(customFontName);
+                    if (replacementAsset == null)
                     {
                         TranslatorCore.LogWarning($"[AlternateTMP] Failed to load custom font '{customFontName}'");
                         return;
                     }
                 }
-
-                // Try to find the fallback font in our cache (exact match)
-                if (_alternateTMPFontCache.TryGetValue(fallbackName, out object fallbackFont))
+                else
                 {
-                    fontProp.SetValue(instance, fallbackFont, null);
-                    TranslatorCore.LogInfo($"[AlternateTMP] Applied fallback font '{fallbackName}' (exact match)");
-                    return;
-                }
-
-                // Try partial match (font name contains fallback name or vice versa)
-                foreach (var kvp in _alternateTMPFontCache)
-                {
-                    if (kvp.Key.IndexOf(fallbackName, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        fallbackName.IndexOf(kvp.Key, StringComparison.OrdinalIgnoreCase) >= 0)
+                    // Try exact match in game font cache
+                    if (_alternateTMPFontCache.TryGetValue(fallbackName, out object cachedFont))
                     {
-                        fontProp.SetValue(instance, kvp.Value, null);
+                        replacementAsset = cachedFont;
+                    }
+                    else
+                    {
+                        // Try partial match
+                        foreach (var kvp in _alternateTMPFontCache)
+                        {
+                            if (kvp.Key.IndexOf(fallbackName, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                fallbackName.IndexOf(kvp.Key, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                replacementAsset = kvp.Value;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (replacementAsset == null)
+                    {
+                        TranslatorCore.LogWarning($"[AlternateTMP] Fallback font '{fallbackName}' not found in game fonts");
                         return;
                     }
                 }
 
-                // Log if fallback not found
-                TranslatorCore.LogWarning($"[AlternateTMP] Fallback font '{fallbackName}' not found in game fonts");
+                // Check if already replaced with the same font (avoid redundant work)
+                string currentFontName = (originalFont is UnityEngine.Object curObj) ? curObj.name : null;
+                string replacementName = (replacementAsset is UnityEngine.Object repObj) ? repObj.name : null;
+                if (currentFontName == replacementName && !string.IsNullOrEmpty(currentFontName)) return;
+
+                // Store original font for restore (via FontManager tracking)
+                int instId = TypeHelper.GetInstanceID(instance);
+                if (instId != -1 && originalFont != null)
+                    FontManager.TrackOriginalFont(instId, originalFont);
+
+                // Replace the font: replacement becomes PRIMARY
+                fontProp.SetValue(instance, replacementAsset, null);
+
+                // Set material to match the replacement font
+                try
+                {
+                    var materialField = replacementAsset.GetType().GetField("material", BindingFlags.Public | BindingFlags.Instance);
+                    if (materialField != null)
+                    {
+                        var fontMaterial = materialField.GetValue(replacementAsset) as Material;
+                        if (fontMaterial != null)
+                        {
+                            var fontSharedMatProp = instance.GetType().GetProperty("fontSharedMaterial", BindingFlags.Public | BindingFlags.Instance);
+                            if (fontSharedMatProp != null && fontSharedMatProp.CanWrite)
+                                fontSharedMatProp.SetValue(instance, fontMaterial, null);
+                        }
+                    }
+                }
+                catch { }
+
+                // Add original game font as FALLBACK on the replacement
+                // (so missing chars in replacement fall back to original)
+                if (originalFont != null)
+                {
+                    TryAddFallbackFont(replacementAsset, originalFont);
+                }
+
+                // Force mesh regeneration
+                try
+                {
+                    var forceMeshUpdate = instance.GetType().GetMethod("ForceMeshUpdate",
+                        BindingFlags.Public | BindingFlags.Instance,
+                        null, Type.EmptyTypes, null);
+                    forceMeshUpdate?.Invoke(instance, null);
+                }
+                catch { }
             }
             catch (Exception ex)
             {
@@ -1800,82 +1759,6 @@ namespace UnityGameTranslator.Core
         private static Dictionary<string, float> _alternateTMPOriginalSizes = new Dictionary<string, float>();
 
         /// <summary>
-        /// Log detailed font diagnostic information (mesh state, glyph checks, etc.)
-        /// Only called when debug_ai is enabled.
-        /// </summary>
-        private static void LogFontDebugDiagnostics(object instance, object customFontAsset, string customFontName)
-        {
-            try
-            {
-                TranslatorCore.LogInfo($"[AlternateTMP] Custom font type: {customFontAsset.GetType().FullName}");
-
-                var textPropDbg = instance.GetType().GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
-                if (textPropDbg != null)
-                {
-                    var currentText = textPropDbg.GetValue(instance, null) as string ?? "(null)";
-                    TranslatorCore.LogInfo($"[AlternateTMP] Current text content: '{(currentText.Length > 50 ? currentText.Substring(0, 50) + "..." : currentText)}'");
-                }
-
-                var compMesh = instance as Component;
-                if (compMesh != null)
-                {
-                    var meshFilter = compMesh.GetComponent<MeshFilter>();
-                    if (meshFilter != null && meshFilter.sharedMesh != null)
-                    {
-                        var mesh = meshFilter.sharedMesh;
-                        TranslatorCore.LogInfo($"[AlternateTMP] Mesh: vertices={mesh.vertexCount}, bounds={mesh.bounds.size}");
-                        var uvs = mesh.uv;
-                        if (uvs != null && uvs.Length >= 4)
-                        {
-                            TranslatorCore.LogInfo($"[AlternateTMP] First quad UVs: ({uvs[0].x:F3},{uvs[0].y:F3}) ({uvs[1].x:F3},{uvs[1].y:F3}) ({uvs[2].x:F3},{uvs[2].y:F3}) ({uvs[3].x:F3},{uvs[3].y:F3})");
-                        }
-                    }
-                    else
-                    {
-                        TranslatorCore.LogInfo($"[AlternateTMP] No mesh found on component (normal for pending components)");
-                    }
-
-                    var meshRenderer = compMesh.GetComponent<MeshRenderer>();
-                    if (meshRenderer != null)
-                    {
-                        var mat = meshRenderer.sharedMaterial;
-                        var mainTex = mat?.mainTexture;
-                        TranslatorCore.LogInfo($"[AlternateTMP] Renderer material: {mat?.name ?? "null"}, texture: {mainTex?.name ?? "null"} ({mainTex?.width}x{mainTex?.height}), enabled={meshRenderer.enabled}");
-                    }
-                }
-
-                // Check glyph dictionary
-                var dictField = customFontAsset.GetType().GetField("m_characterDictionary", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (dictField != null)
-                {
-                    var dict = dictField.GetValue(customFontAsset);
-                    if (dict != null)
-                    {
-                        var countProp = dict.GetType().GetProperty("Count");
-                        int count = (int)countProp.GetValue(dict);
-                        TranslatorCore.LogInfo($"[AlternateTMP] Font dictionary has {count} characters");
-                    }
-                }
-
-                var glyphListField = customFontAsset.GetType().GetField("m_glyphInfoList", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (glyphListField != null)
-                {
-                    var glyphList = glyphListField.GetValue(customFontAsset);
-                    if (glyphList != null)
-                    {
-                        var glyphCountProp = glyphList.GetType().GetProperty("Count");
-                        int glyphCount = (int)glyphCountProp.GetValue(glyphList);
-                        TranslatorCore.LogInfo($"[AlternateTMP] Font glyph list has {glyphCount} glyphs");
-                    }
-                }
-            }
-            catch (Exception debugEx)
-            {
-                TranslatorCore.LogWarning($"[AlternateTMP] Debug check failed: {debugEx.Message}");
-            }
-        }
-
-        /// <summary>
         /// Search for all loaded TMP font assets of the alternate type.
         /// </summary>
         private static void SearchAlternateTMPFonts(Type fontAssetType)
@@ -1974,12 +1857,7 @@ namespace UnityGameTranslator.Core
 
                 // Check if own UI (use UI-specific prompt)
                 bool isOwnUI = TranslatorCore.IsOwnUITranslatable(component);
-                string beforeTranslate = __0;
                 __0 = TranslatorCore.TranslateTextWithTracking(__0, component, isOwnUI);
-                if (__0 != beforeTranslate)
-                {
-                    TranslatorCore.LogInfo($"[AlternateTMP] Translated: '{(beforeTranslate.Length > 30 ? beforeTranslate.Substring(0, 30) + "..." : beforeTranslate)}' -> '{(__0.Length > 30 ? __0.Substring(0, 30) + "..." : __0)}'");
-                }
             }
             catch (Exception ex)
             {

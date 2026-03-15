@@ -234,6 +234,9 @@ namespace UnityGameTranslator.Core
                             bool shouldRestore = globalRestore || fontDisabled;
                             if (shouldRestore)
                             {
+                                // Restore original font before restoring text
+                                FontManager.RestoreOriginalFont(obj);
+
                                 string original = GetOriginalText(instanceId);
                                 if (original != null)
                                 {
@@ -285,6 +288,10 @@ namespace UnityGameTranslator.Core
         private static int RefreshAlternateTMPComponents(bool shouldRestore, ref int restored)
         {
             int refreshed = 0;
+
+            // When TypeHelper resolved TMP types to TMProOld, those components are already
+            // in cachedTMPMono and processed by the standard TMP loop. Skip to avoid double processing.
+            if (TypeHelper.UseAlternateTMP) return 0;
 
             try
             {
@@ -375,11 +382,16 @@ namespace UnityGameTranslator.Core
                     int instanceId = TypeHelper.GetInstanceID(component);
                     if (instanceId == -1) continue;
 
-                    // Check per-font translation state
+                    // Check per-font translation state (check both current and original font name)
                     string compFontName = TypeHelper.GetFontName(component);
-                    bool shouldRestore = globalRestore || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
+                    string origFontName = FontManager.GetOriginalFontName(instanceId);
+                    bool fontDisabled = (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName))
+                        || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
+                    bool shouldRestore = globalRestore || fontDisabled;
                     if (shouldRestore)
                     {
+                        FontManager.RestoreOriginalFont(component);
+
                         string original = GetOriginalText(instanceId);
                         if (original != null)
                         {
@@ -556,10 +568,19 @@ namespace UnityGameTranslator.Core
                 if (obj == null) continue;
                 try
                 {
-                    string compFont = TypeHelper.GetFontName(obj);
-                    if (string.IsNullOrEmpty(compFont) || !fontNames.Contains(compFont)) continue;
-
                     int id = obj.GetInstanceID();
+
+                    // Match against both current font name AND tracked original font name
+                    // (once replaced, component has replacement font name, not original)
+                    string compFont = TypeHelper.GetFontName(obj);
+                    string origFont = FontManager.GetOriginalFontName(id);
+                    bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
+                        || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
+                    if (!matches) continue;
+
+                    // Restore font before text (material + ForceMeshUpdate included)
+                    FontManager.RestoreOriginalFont(obj);
+
                     string original = GetOriginalText(id);
                     if (original != null)
                     {
@@ -592,11 +613,19 @@ namespace UnityGameTranslator.Core
                         : tryCastMethod.Invoke(obj, null);
                     if (component == null) continue;
 
-                    string compFont = TypeHelper.GetFontName(component);
-                    if (string.IsNullOrEmpty(compFont) || !fontNames.Contains(compFont)) continue;
-
                     int id = TypeHelper.GetInstanceID(component);
                     if (id == -1) continue;
+
+                    // Match against both current font name AND tracked original font name
+                    string compFont = TypeHelper.GetFontName(component);
+                    string origFont = FontManager.GetOriginalFontName(id);
+                    bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
+                        || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
+                    if (!matches) continue;
+
+                    // Restore font before text
+                    FontManager.RestoreOriginalFont(component);
+
                     string original = GetOriginalText(id);
                     if (original != null)
                     {
@@ -624,16 +653,24 @@ namespace UnityGameTranslator.Core
                 if (obj == null) continue;
                 try
                 {
-                    string compFont = TypeHelper.GetFontName(obj);
-                    if (string.IsNullOrEmpty(compFont) || !fontNames.Contains(compFont)) continue;
-
                     int id = obj.GetInstanceID();
+
+                    // Match against both current font name AND tracked original font name
+                    string compFont = TypeHelper.GetFontName(obj);
+                    string origFont = FontManager.GetOriginalFontName(id);
+                    bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
+                        || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
+                    if (!matches) continue;
+
                     processedTextHashes.Remove(id);
 
                     string currentText = TypeHelper.GetText(obj);
                     if (!string.IsNullOrEmpty(currentText))
                     {
+                        // Set empty then back to force re-render with potentially new font
+                        TypeHelper.SetText(obj, "");
                         TypeHelper.SetText(obj, currentText);
+                        TypeHelper.ForceMeshUpdate(obj);
                         refreshed++;
                     }
                 }
@@ -660,11 +697,16 @@ namespace UnityGameTranslator.Core
                         : tryCastMethod.Invoke(obj, null);
                     if (component == null) continue;
 
-                    string compFont = TypeHelper.GetFontName(component);
-                    if (string.IsNullOrEmpty(compFont) || !fontNames.Contains(compFont)) continue;
-
                     int id = TypeHelper.GetInstanceID(component);
                     if (id == -1) continue;
+
+                    // Match against both current font name AND tracked original font name
+                    string compFont = TypeHelper.GetFontName(component);
+                    string origFont = FontManager.GetOriginalFontName(id);
+                    bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
+                        || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
+                    if (!matches) continue;
+
                     processedTextHashes.Remove(id);
 
                     string currentText = TypeHelper.GetText(component);
@@ -679,6 +721,120 @@ namespace UnityGameTranslator.Core
                 catch { }
             }
             return refreshed;
+        }
+
+        #endregion
+
+        #region Font Highlight (in-game identification)
+
+        // Stores original colors per instance ID for restore after highlight
+        private static readonly Dictionary<int, Color> _highlightOriginalColors = new Dictionary<int, Color>();
+        private static string _highlightedFontName = null;
+
+        // Highlight color for matching font, dim color for non-matching
+        private static readonly Color HighlightColor = new Color(1f, 0f, 0.8f, 1f); // Magenta
+        private static readonly Color DimColor = new Color(1f, 1f, 1f, 0.15f); // Very transparent
+
+        /// <summary>
+        /// Highlight all text components using a specific font.
+        /// Matching components get a bright color, others get dimmed.
+        /// </summary>
+        public static void HighlightFont(string fontName)
+        {
+            // Clear any existing highlight first
+            if (_highlightedFontName != null)
+                ClearHighlight();
+
+            _highlightedFontName = fontName;
+
+            try
+            {
+                ForceRefreshCache();
+
+                if (cachedTMPMono != null)
+                {
+                    foreach (var obj in cachedTMPMono)
+                    {
+                        if (obj == null) continue;
+                        try { HighlightComponent(obj, fontName); } catch { }
+                    }
+                }
+
+                if (cachedUIMono != null)
+                {
+                    foreach (var obj in cachedUIMono)
+                    {
+                        if (obj == null) continue;
+                        try { HighlightComponent(obj, fontName); } catch { }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogWarning($"[Scanner] HighlightFont error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Clear all font highlights, restoring original colors.
+        /// </summary>
+        public static void ClearHighlight()
+        {
+            if (_highlightedFontName == null && _highlightOriginalColors.Count == 0) return;
+
+            try
+            {
+                // Restore all cached original colors
+                if (cachedTMPMono != null)
+                {
+                    foreach (var obj in cachedTMPMono)
+                    {
+                        if (obj == null) continue;
+                        try { RestoreComponentColor(obj); } catch { }
+                    }
+                }
+
+                if (cachedUIMono != null)
+                {
+                    foreach (var obj in cachedUIMono)
+                    {
+                        if (obj == null) continue;
+                        try { RestoreComponentColor(obj); } catch { }
+                    }
+                }
+            }
+            catch { }
+
+            _highlightOriginalColors.Clear();
+            _highlightedFontName = null;
+        }
+
+        private static void HighlightComponent(UnityEngine.Object obj, string targetFontName)
+        {
+            int id = obj.GetInstanceID();
+
+            // Determine if this component's font matches (check both current and original name)
+            string compFont = TypeHelper.GetFontName(obj);
+            string origFont = FontManager.GetOriginalFontName(id);
+            bool matches = (!string.IsNullOrEmpty(compFont) && string.Equals(compFont, targetFontName, StringComparison.OrdinalIgnoreCase))
+                || (!string.IsNullOrEmpty(origFont) && string.Equals(origFont, targetFontName, StringComparison.OrdinalIgnoreCase));
+
+            // Store original color
+            Color originalColor = TypeHelper.GetTextColor(obj);
+            if (!_highlightOriginalColors.ContainsKey(id))
+                _highlightOriginalColors[id] = originalColor;
+
+            // Apply highlight or dim
+            TypeHelper.SetTextColor(obj, matches ? HighlightColor : DimColor);
+        }
+
+        private static void RestoreComponentColor(UnityEngine.Object obj)
+        {
+            int id = obj.GetInstanceID();
+            if (_highlightOriginalColors.TryGetValue(id, out var originalColor))
+            {
+                TypeHelper.SetTextColor(obj, originalColor);
+            }
         }
 
         #endregion

@@ -372,31 +372,28 @@ namespace UnityGameTranslator.Core
 
             bool enabledChanged = settings.enabled != enabled;
             bool fallbackChanged = settings.fallback != fallbackFont;
-            bool wasEnabled = settings.enabled;
             string oldFallback = settings.fallback; // Save BEFORE changing
 
             settings.enabled = enabled;
             settings.fallback = fallbackFont;
 
-            // Handle fallback changes
+            // Handle fallback or enabled changes
             if (fallbackChanged || enabledChanged)
             {
-                // Remove old fallback from the font
-                RemoveFallbackApplied(fontName);
+                // Remove old fallback tracking (both forward and reverse keys)
+                _fallbackAppliedFonts.Remove(fontName);
+                _fallbackAppliedFonts.Remove(fontName + "_reverse");
 
-                // Apply new fallback immediately (don't wait for Harmony patch —
-                // on IL2CPP, TypeHelper.SetText doesn't trigger Harmony patches)
-                if (enabled && !string.IsNullOrEmpty(fallbackFont))
-                {
-                    if (_detectedTMPFontObjects.TryGetValue(fontName, out var fontObj))
-                    {
-                        EnsureFallbackApplied(fontObj, fontName);
-                    }
-                }
+                // Restore original fonts on ALL components that had this font replaced.
+                // Without this, components keep the old replacement font forever.
+                RestoreAllComponentsForFont(fontName);
+
+                TranslatorCore.LogInfo($"[FontManager] Font settings changed for '{fontName}': " +
+                    $"enabled={enabled}, fallback='{fallbackFont ?? "(none)"}' (was '{oldFallback ?? "(none)"}')");
             }
 
             // Refresh all text to re-evaluate with new settings
-            if (enabledChanged || (fallbackChanged && enabled))
+            if (enabledChanged || fallbackChanged)
             {
                 TranslatorScanner.ClearProcessedCache();
                 TranslatorScanner.ForceRefreshAllText();
@@ -404,6 +401,112 @@ namespace UnityGameTranslator.Core
 
             // Save changes
             TranslatorCore.SaveCache();
+        }
+
+        /// <summary>
+        /// Restore original fonts on all components tracked for a given font name.
+        /// Called when font settings change so the new settings can be applied fresh.
+        /// </summary>
+        private static void RestoreAllComponentsForFont(string fontName)
+        {
+            if (string.IsNullOrEmpty(fontName)) return;
+
+            // Collect instance IDs to restore (can't modify dictionary during iteration)
+            var toRestore = new List<int>();
+            foreach (var kvp in _originalFontsPerComponent)
+            {
+                string origName = (kvp.Value is UnityEngine.Object uobj) ? uobj.name : null;
+                if (origName == fontName)
+                {
+                    toRestore.Add(kvp.Key);
+                }
+            }
+
+            if (toRestore.Count == 0) return;
+
+            TranslatorCore.LogInfo($"[FontManager] Restoring {toRestore.Count} components to original font '{fontName}'");
+
+            foreach (int instanceId in toRestore)
+            {
+                if (!_originalFontsPerComponent.TryGetValue(instanceId, out var originalFont))
+                    continue;
+
+                var component = FindComponentByInstanceId(instanceId);
+                if (component != null)
+                {
+                    TypeHelper.SetFont(component, originalFont);
+                    SetFontSharedMaterial(component, originalFont);
+                    TypeHelper.ForceMeshUpdate(component);
+                }
+
+                _originalFontsPerComponent.Remove(instanceId);
+            }
+        }
+
+        /// <summary>
+        /// Find a cached component by its instance ID.
+        /// Set fontSharedMaterial on a TMP component from a font asset's material.
+        /// Uses IL2CPP-safe casting for proxy objects.
+        /// </summary>
+        private static void SetFontSharedMaterial(object component, object fontAsset)
+        {
+            if (component == null || fontAsset == null) return;
+            try
+            {
+                var materialField = fontAsset.GetType().GetField("material",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                if (materialField == null) return;
+
+                var fontMaterial = materialField.GetValue(fontAsset);
+                if (fontMaterial == null) return;
+
+                var fontSharedMatProp = component.GetType().GetProperty("fontSharedMaterial",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                if (fontSharedMatProp == null || !fontSharedMatProp.CanWrite) return;
+
+                // Cast for IL2CPP compatibility (proxy types need explicit casting)
+                var castedMaterial = TypeHelper.Il2CppCast(fontMaterial, fontSharedMatProp.PropertyType);
+                fontSharedMatProp.SetValue(component, castedMaterial, null);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Searches through scanner caches to find the Unity Object.
+        /// </summary>
+        private static object FindComponentByInstanceId(int instanceId)
+        {
+            // Search through all objects of the TMP type
+            if (TypeHelper.TMP_TextType != null)
+            {
+                try
+                {
+                    var allTMP = Resources.FindObjectsOfTypeAll(TypeHelper.TMP_TextType);
+                    foreach (var obj in allTMP)
+                    {
+                        if (obj != null && obj.GetInstanceID() == instanceId)
+                            return obj;
+                    }
+                }
+                catch { }
+            }
+
+            // Search through UI.Text
+            if (TypeHelper.UI_TextType != null)
+            {
+                try
+                {
+                    var allUI = Resources.FindObjectsOfTypeAll(TypeHelper.UI_TextType);
+                    foreach (var obj in allUI)
+                    {
+                        if (obj != null && obj.GetInstanceID() == instanceId)
+                            return obj;
+                    }
+                }
+                catch { }
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -464,30 +567,6 @@ namespace UnityGameTranslator.Core
             return false;
         }
 
-        /// <summary>
-        /// Remove fallback from a TMP font (via reflection).
-        /// </summary>
-        private static void RemoveFallbackFromFont(object font)
-        {
-            if (font == null) return;
-
-            try
-            {
-                var fallbackList = GetFallbackListReflection(font);
-                if (fallbackList == null) return;
-
-                // Clear the entire fallback list — on IL2CPP, Remove() may not work
-                // because object identity comparison fails across IL2CPP/managed boundary
-                var clearMethod = fallbackList.GetType().GetMethod("Clear");
-                if (clearMethod != null)
-                {
-                    clearMethod.Invoke(fallbackList, null);
-                    TranslatorCore.LogInfo($"[FontManager] Cleared fallback list for font");
-                }
-            }
-            catch { }
-        }
-
         // Track which fonts already have our fallback added (by font name)
         private static readonly HashSet<string> _fallbackAppliedFonts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -542,6 +621,13 @@ namespace UnityGameTranslator.Core
             // SetFont to replacement
             TypeHelper.SetFont(component, replacementFont);
 
+            // Set fontSharedMaterial to match the replacement font's material
+            // Without this, TMP renders with the old font's atlas/shader → empty rectangles
+            SetFontSharedMaterial(component, replacementFont);
+
+            // Force mesh regeneration so the new font renders immediately
+            TypeHelper.ForceMeshUpdate(component);
+
             // Add original game font as fallback on the replacement font
             // So missing chars in replacement → fall back to original
             if (originalFontObj != null && !_fallbackAppliedFonts.Contains(originalFontName + "_reverse"))
@@ -578,8 +664,21 @@ namespace UnityGameTranslator.Core
             if (_originalFontsPerComponent.TryGetValue(instanceId, out var originalFont))
             {
                 TypeHelper.SetFont(component, originalFont);
+                SetFontSharedMaterial(component, originalFont);
+                TypeHelper.ForceMeshUpdate(component);
                 _originalFontsPerComponent.Remove(instanceId);
             }
+        }
+
+        /// <summary>
+        /// Track original font for a component (used by AlternateTMP path).
+        /// Only stores on first call per component (preserves true original).
+        /// </summary>
+        public static void TrackOriginalFont(int instanceId, object originalFont)
+        {
+            if (instanceId == -1 || originalFont == null) return;
+            if (!_originalFontsPerComponent.ContainsKey(instanceId))
+                _originalFontsPerComponent[instanceId] = originalFont;
         }
 
         /// <summary>
@@ -607,7 +706,7 @@ namespace UnityGameTranslator.Core
         {
             if (fontObj == null || string.IsNullOrEmpty(fontName)) return;
 
-            // Store font object reference for later use (RemoveFallbackApplied needs it)
+            // Store font object reference for font scanning
             if (!_detectedTMPFontObjects.ContainsKey(fontName))
                 _detectedTMPFontObjects[fontName] = fontObj;
 
@@ -656,31 +755,6 @@ namespace UnityGameTranslator.Core
         /// Remove fallback from a font and clear the applied cache.
         /// Call when fallback settings change.
         /// </summary>
-        public static void RemoveFallbackApplied(string fontName)
-        {
-            _fallbackAppliedFonts.Remove(fontName);
-            if (_detectedTMPFontObjects.TryGetValue(fontName, out var fontObj))
-            {
-                RemoveFallbackFromFont(fontObj);
-
-                // Force TMP to rebuild its internal lookup caches
-                var fontType = fontObj.GetType();
-                try
-                {
-                    var dirtyProp = fontType.GetProperty("IsFontAssetLookupTablesDirty",
-                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-                    if (dirtyProp != null && dirtyProp.CanWrite)
-                        dirtyProp.SetValue(fontObj, true, null);
-
-                    // Also try ReadFontAssetDefinition to force full rebuild
-                    var readMethod = fontType.GetMethod("ReadFontAssetDefinition",
-                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-                    readMethod?.Invoke(fontObj, null);
-                }
-                catch { }
-            }
-        }
-
         /// <summary>
         /// Get the replacement font for a Unity Font (UI.Text).
         /// Returns null if no fallback is configured.
@@ -1172,6 +1246,8 @@ namespace UnityGameTranslator.Core
                             var result = method.Invoke(null, new object[] { font });
                             if (result != null)
                             {
+                                if (result is UnityEngine.Object uobj && string.IsNullOrEmpty(uobj.name))
+                                    uobj.name = font.name + " SDF";
                                 TranslatorCore.LogInfo($"[FontManager] TMP_FontAsset.CreateFontAsset(Font) succeeded!");
                                 return result;
                             }
@@ -1228,6 +1304,8 @@ namespace UnityGameTranslator.Core
                             var result = method.Invoke(null, args);
                             if (result != null)
                             {
+                                if (result is UnityEngine.Object uobj && string.IsNullOrEmpty(uobj.name))
+                                    uobj.name = font.name + " SDF";
                                 TranslatorCore.LogInfo($"[FontManager] TMP_FontAsset.CreateFontAsset(Font, advanced) succeeded!");
                                 return result;
                             }
@@ -1361,6 +1439,9 @@ namespace UnityGameTranslator.Core
                     var result = createMethod.Invoke(null, new object[] { font }) ;
                     if (result != null)
                     {
+                        // Ensure the asset has a proper name
+                        if (result is UnityEngine.Object uobj && string.IsNullOrEmpty(uobj.name))
+                            uobj.name = font.name + " SDF";
                         TranslatorCore.LogInfo($"[FontManager] Created TMP font via CreateFontAsset(Font)");
                         return result;
                     }
@@ -1384,7 +1465,11 @@ namespace UnityGameTranslator.Core
                     {
                         var result = createMethodByName.Invoke(null, new object[] { familyName, styleName, 90 }) ;
                         if (result != null)
+                        {
+                            if (result is UnityEngine.Object uobj && string.IsNullOrEmpty(uobj.name))
+                                uobj.name = font.name + " SDF";
                             return result;
+                        }
                     }
                     catch { }
 
@@ -1396,7 +1481,11 @@ namespace UnityGameTranslator.Core
                         {
                             var result = createMethodByName.Invoke(null, new object[] { familyName, "Regular", 90 }) ;
                             if (result != null)
+                            {
+                                if (result is UnityEngine.Object uobj && string.IsNullOrEmpty(uobj.name))
+                                    uobj.name = font.name + " SDF";
                                 return result;
+                            }
                         }
                         catch { }
                     }
@@ -1409,7 +1498,11 @@ namespace UnityGameTranslator.Core
                         {
                             var result = createMethodByName.Invoke(null, new object[] { font.name, "Regular", 90 }) ;
                             if (result != null)
+                            {
+                                if (result is UnityEngine.Object uobj && string.IsNullOrEmpty(uobj.name))
+                                    uobj.name = font.name + " SDF";
                                 return result;
+                            }
                         }
                         catch { }
                     }
