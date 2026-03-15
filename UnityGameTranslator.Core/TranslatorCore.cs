@@ -606,6 +606,10 @@ namespace UnityGameTranslator.Core
             }
 
             LoadCache();
+
+            // Pre-load configured fallback fonts so they're ready for first use
+            FontManager.PreloadConfiguredFallbacks();
+
             StartTranslationWorker();
 
             if (Config.preload_model && Config.enable_ai)

@@ -1354,6 +1354,38 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
+        /// Pre-load fallback fonts that are already configured in settings.
+        /// Call after LoadCache so FontSettingsMap is populated.
+        /// This avoids the first-use delay where the font is created lazily
+        /// during a Harmony prefix, causing the first text to render wrong.
+        /// </summary>
+        public static void PreloadConfiguredFallbacks()
+        {
+            int preloaded = 0;
+            foreach (var kvp in TranslatorCore.FontSettingsMap)
+            {
+                if (!kvp.Value.enabled) continue;
+                if (string.IsNullOrEmpty(kvp.Value.fallback)) continue;
+
+                // Pre-create the fallback asset so it's cached for first use
+                if (!_fallbackAssets.ContainsKey(kvp.Value.fallback))
+                {
+                    var asset = CreateFallbackAsset(kvp.Value.fallback);
+                    if (asset != null)
+                    {
+                        _fallbackAssets[kvp.Value.fallback] = asset;
+                        if (asset is UnityEngine.Object uobj && !_gameTMPFonts.ContainsKey(uobj.name))
+                            _createdFallbackFontNames.Add(uobj.name);
+                        preloaded++;
+                    }
+                }
+            }
+
+            if (preloaded > 0)
+                TranslatorCore.LogInfo($"[FontManager] Pre-loaded {preloaded} fallback font(s)");
+        }
+
+        /// <summary>
         /// Scan all TMP_FontAsset objects loaded in the game.
         /// These are valid IL2CPP objects that can be used as font replacements
         /// without needing CreateDynamicFontFromOSFont (which is stripped on IL2CPP).
