@@ -31,6 +31,23 @@ namespace UnityGameTranslator.Core
         // IL2CPP specific cache (managed by scanner)
         internal object IL2CPPType;                          // Cached Il2CppType.Of<T>() result
         internal MethodInfo TryCastMethod;                   // Cached TryCast<T> generic method
+
+        // Discovery strategy cache (optimization B: skip strategies known to fail)
+        internal ScanStrategy WinningStrategy = ScanStrategy.Unknown;
+    }
+
+    /// <summary>
+    /// Which discovery strategy succeeded for a RegisteredTextType.
+    /// Once known, only that strategy is retried on subsequent refreshes.
+    /// Reset on scene change to handle new assemblies/types.
+    /// </summary>
+    public enum ScanStrategy
+    {
+        Unknown = 0,          // Not yet determined — try all strategies
+        IL2CPPNative = 1,
+        TypeHelper = 2,
+        StaticLists = 3,
+        MonoBehaviourFilter = 4
     }
 
     /// <summary>

@@ -97,6 +97,10 @@ namespace UnityGameTranslator.Core
         private const float COMPONENT_CACHE_DURATION = 2f;
         private static bool cacheRefreshPending = false;
 
+        // Spread refresh: index of the next type to refresh (one per Scan() call)
+        private static int _nextRefreshTypeIndex = 0;
+        private static bool _refreshCycleInProgress = false;
+
         #endregion
 
         #region Quick Skip Cache
@@ -142,13 +146,18 @@ namespace UnityGameTranslator.Core
             inputFieldTextIds.Clear();
             componentOriginals.Clear();
 
-            // Clear all per-type caches
+            // Clear all per-type caches and reset discovery strategies
             foreach (var type in _registeredTypes)
             {
                 type.CachedComponents = null;
                 type.BatchIndex = 0;
                 type.LoggedOnce = false;
+                type.WinningStrategy = ScanStrategy.Unknown;
             }
+
+            // Reset spread refresh state
+            _nextRefreshTypeIndex = 0;
+            _refreshCycleInProgress = false;
 
             // Clear pending updates (components from old scene are invalid)
             lock (pendingUpdatesLock)
@@ -202,6 +211,7 @@ namespace UnityGameTranslator.Core
         /// <summary>
         /// Unified scan method - replaces ScanMono() and ScanIL2CPP().
         /// Works for both Mono and IL2CPP runtimes.
+        /// Uses spread refresh: only one type cache is refreshed per call to avoid frame spikes.
         /// </summary>
         public static void Scan()
         {
@@ -217,11 +227,11 @@ namespace UnityGameTranslator.Core
 
             float currentTime = Time.realtimeSinceStartup;
 
-            // Check if cache refresh is needed
+            // Check if cache refresh is needed (spread: one type per Scan() call)
             bool needsRefresh = (currentTime - lastComponentCacheTime > COMPONENT_CACHE_DURATION);
 
-            // Some types may have null caches on first run
-            if (!needsRefresh)
+            // Some types may have null caches on first run — trigger immediate refresh cycle
+            if (!needsRefresh && !_refreshCycleInProgress)
             {
                 foreach (var type in _registeredTypes)
                 {
@@ -233,24 +243,42 @@ namespace UnityGameTranslator.Core
                 }
             }
 
-            if (needsRefresh)
+            // Start a new refresh cycle if needed
+            if (needsRefresh && !_refreshCycleInProgress)
             {
-                if (scanCycleComplete)
+                _refreshCycleInProgress = true;
+                _nextRefreshTypeIndex = 0;
+            }
+
+            // Spread refresh: refresh ONE type per Scan() call
+            if (_refreshCycleInProgress && _registeredTypes.Count > 0)
+            {
+                if (_nextRefreshTypeIndex < _registeredTypes.Count)
                 {
-                    RefreshAllCaches();
+                    var type = _registeredTypes[_nextRefreshTypeIndex];
+                    type.CachedComponents = RefreshTypeCache(type);
+                    if (!type.LoggedOnce && type.CachedComponents != null && type.CachedComponents.Length > 0)
+                    {
+                        TranslatorCore.LogInfo($"Scan: Found {type.CachedComponents.Length} {type.Name} components");
+                        type.LoggedOnce = true;
+                    }
+                    _nextRefreshTypeIndex++;
+                }
+
+                // Check if refresh cycle is complete
+                if (_nextRefreshTypeIndex >= _registeredTypes.Count)
+                {
+                    _refreshCycleInProgress = false;
                     lastComponentCacheTime = currentTime;
                     cacheRefreshPending = false;
                 }
-                else
-                {
-                    cacheRefreshPending = true;
-                }
             }
 
-            if (cacheRefreshPending && scanCycleComplete)
+            // Handle deferred refresh (scan cycle wasn't complete when refresh was needed)
+            if (cacheRefreshPending && scanCycleComplete && !_refreshCycleInProgress)
             {
-                RefreshAllCaches();
-                lastComponentCacheTime = currentTime;
+                _refreshCycleInProgress = true;
+                _nextRefreshTypeIndex = 0;
                 cacheRefreshPending = false;
             }
 
@@ -269,7 +297,9 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Refresh caches for all registered types.
+        /// Refresh caches for all registered types at once.
+        /// Only used by ForceRefreshCache() for immediate operations (font highlight, etc.).
+        /// Normal scan path uses spread refresh (one type per Scan() call).
         /// </summary>
         private static void RefreshAllCaches()
         {
@@ -591,23 +621,71 @@ namespace UnityGameTranslator.Core
             var seenIds = new HashSet<int>();
             var results = new List<UnityEngine.Object>();
 
+            // Optimization B: if we already know which strategy works, use only that one
+            if (type.WinningStrategy != ScanStrategy.Unknown)
+            {
+                switch (type.WinningStrategy)
+                {
+                    case ScanStrategy.IL2CPPNative:
+                        TryAddFromIL2CPPNative(type, results, seenIds);
+                        break;
+                    case ScanStrategy.TypeHelper:
+                        TryAddFromTypeHelper(type, results, seenIds);
+                        break;
+                    case ScanStrategy.StaticLists:
+                        TryAddFromStaticLists(type, results, seenIds);
+                        break;
+                    case ScanStrategy.MonoBehaviourFilter:
+                        TryAddFromMonoBehaviourFilter(type, results, seenIds);
+                        break;
+                }
+
+                // If the winning strategy stopped working (scene change edge case),
+                // reset and fall through to full discovery next cycle
+                if (results.Count == 0)
+                    type.WinningStrategy = ScanStrategy.Unknown;
+
+                return results.Count > 0 ? results.ToArray() : null;
+            }
+
+            // First time: try all strategies in order, record the winner
+
             // Strategy 1: IL2CPP native scan
             TryAddFromIL2CPPNative(type, results, seenIds);
+            if (results.Count > 0)
+            {
+                type.WinningStrategy = ScanStrategy.IL2CPPNative;
+                // Still try TypeHelper to catch additional components
+                TryAddFromTypeHelper(type, results, seenIds);
+                return results.ToArray();
+            }
 
             // Strategy 2: TypeHelper (works for both Mono and IL2CPP)
             TryAddFromTypeHelper(type, results, seenIds);
+            if (results.Count > 0)
+            {
+                type.WinningStrategy = ScanStrategy.TypeHelper;
+                return results.ToArray();
+            }
 
             // Strategy 3: Static list fields (for NGUI etc.)
             TryAddFromStaticLists(type, results, seenIds);
-
-            // Strategy 4: MonoBehaviour filter fallback
-            // Used when all other strategies fail (common on IL2CPP for TMP and third-party types)
-            if (results.Count == 0)
+            if (results.Count > 0)
             {
-                TryAddFromMonoBehaviourFilter(type, results, seenIds);
+                type.WinningStrategy = ScanStrategy.StaticLists;
+                return results.ToArray();
             }
 
-            return results.Count > 0 ? results.ToArray() : null;
+            // Strategy 4: MonoBehaviour filter fallback (expensive)
+            TryAddFromMonoBehaviourFilter(type, results, seenIds);
+            if (results.Count > 0)
+            {
+                type.WinningStrategy = ScanStrategy.MonoBehaviourFilter;
+                TranslatorCore.LogInfo($"[Scanner] {type.Name}: using MonoBehaviourFilter (expensive fallback)");
+                return results.ToArray();
+            }
+
+            return null;
         }
 
         private static void TryAddFromIL2CPPNative(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)

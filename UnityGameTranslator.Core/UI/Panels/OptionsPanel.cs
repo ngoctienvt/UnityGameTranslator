@@ -705,24 +705,18 @@ namespace UnityGameTranslator.Core.UI.Panels
                     options.AddRange(availableFonts);
                 }
 
-                // Add custom fonts (user-provided SDF fonts from fonts/ folder)
-                // Custom fonts only work with TMP fonts (standard or alt), NOT Unity Fonts
-                // because they are SDF-based TMP_FontAsset, not regular Font
+                // Add custom fonts (user-provided fonts from fonts/ folder — JSON+PNG or TTF/OTF)
+                // Custom fonts work with TMP fonts (rasterized to SDF TMP_FontAsset on demand)
                 string[] customFonts = null;
                 if (isTMPFont)
                 {
                     customFonts = FontManager.GetCustomFontNames();
                     if (customFonts != null && customFonts.Length > 0)
                     {
-                        // Add separator if there are other fonts
                         if (options.Count > 1)
-                        {
                             options.Add("--- Custom Fonts ---");
-                        }
                         foreach (var customFont in customFonts)
-                        {
                             options.Add("[Custom] " + customFont);
-                        }
                         TranslatorCore.LogInfo($"[OptionsPanel] Added {customFonts.Length} custom font(s) to dropdown");
                     }
                 }

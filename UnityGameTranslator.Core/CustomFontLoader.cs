@@ -91,12 +91,27 @@ namespace UnityGameTranslator.Core
             public object FontAsset { get; set; } // TMP_FontAsset or TMProOld.TMP_FontAsset
             public bool IsLoaded { get; set; }
             public string Error { get; set; }
+
+            // For TTF fonts: path to the .ttf/.otf file (rasterized on demand)
+            public string TtfPath { get; set; }
+            public bool IsTtf => !string.IsNullOrEmpty(TtfPath);
+
+            // For TTF-rasterized fonts: RGBA pixels stored in memory (no PNG file)
+            public byte[] RgbaPixels { get; set; }
+            public int RgbaWidth { get; set; }
+            public int RgbaHeight { get; set; }
+
+            // Source: "custom" (fonts/ folder), "system" (OS fonts)
+            public string Source { get; set; }
         }
 
         #endregion
 
-        // Loaded custom fonts
+        // Loaded custom fonts (from fonts/ folder only)
         private static readonly Dictionary<string, CustomFontInfo> _customFonts = new Dictionary<string, CustomFontInfo>();
+
+        // Cache folder path (mod's fonts/ directory) for system font rasterization cache
+        private static string _cacheFolderPath;
 
         // Cached type references for reflection
         private static Type _tmpFontAssetType;
@@ -118,6 +133,8 @@ namespace UnityGameTranslator.Core
         public static void Initialize(string pluginFolder)
         {
             var fontsFolder = Path.Combine(pluginFolder, "fonts");
+            _cacheFolderPath = fontsFolder;
+            int loadedCount = 0;
 
             if (!Directory.Exists(fontsFolder))
             {
@@ -127,13 +144,17 @@ namespace UnityGameTranslator.Core
 
             TranslatorCore.LogInfo($"[CustomFontLoader] Scanning fonts folder: {fontsFolder}");
 
-            // Find all JSON files
+            // Find all JSON files (skip .cache.json — those are TTF rasterization cache)
             var jsonFiles = Directory.GetFiles(fontsFolder, "*.json");
-            int loadedCount = 0;
 
             foreach (var jsonPath in jsonFiles)
             {
                 var fileName = Path.GetFileNameWithoutExtension(jsonPath);
+
+                // Skip generated cache files (from TTF rasterizer)
+                if (fileName.EndsWith(".cache") || fileName.EndsWith(".gen"))
+                    continue;
+
                 var pngPath = Path.Combine(fontsFolder, fileName + ".png");
 
                 if (!File.Exists(pngPath))
@@ -151,7 +172,6 @@ namespace UnityGameTranslator.Core
 
                 try
                 {
-                    // Parse JSON
                     var jsonContent = File.ReadAllText(jsonPath);
                     fontInfo.AtlasData = JsonConvert.DeserializeObject<MsdfAtlasData>(jsonContent);
 
@@ -175,11 +195,35 @@ namespace UnityGameTranslator.Core
                 _customFonts[fileName] = fontInfo;
             }
 
+            // Scan for TTF/OTF files — register only, rasterize on demand
+            foreach (var ext in new[] { "*.ttf", "*.otf" })
+            {
+                string[] fontFiles;
+                try { fontFiles = Directory.GetFiles(fontsFolder, ext); }
+                catch { continue; }
+
+                foreach (var fontPath in fontFiles)
+                {
+                    var fileName = Path.GetFileNameWithoutExtension(fontPath);
+                    if (_customFonts.ContainsKey(fileName))
+                        continue;
+
+                    _customFonts[fileName] = new CustomFontInfo
+                    {
+                        Name = fileName,
+                        TtfPath = fontPath,
+                        Source = "custom"
+                    };
+                    loadedCount++;
+                    TranslatorCore.LogInfo($"[CustomFontLoader] Registered TTF: {fileName} (will rasterize on demand)");
+                }
+            }
+
             TranslatorCore.LogInfo($"[CustomFontLoader] Found {loadedCount} custom font(s)");
         }
 
         /// <summary>
-        /// Gets the names of all available custom fonts.
+        /// Gets the names of all available custom fonts (from fonts/ folder only).
         /// </summary>
         public static string[] GetCustomFontNames()
         {
@@ -193,12 +237,169 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
+        /// Try to find a .ttf/.otf file for a system font name on the filesystem.
+        /// Handles display names like "Adobe Devanagari Italic" → "AdobeDevanagari-Italic.otf"
+        /// by normalizing names (stripping spaces, checking with style suffixes).
+        /// </summary>
+        public static string FindSystemTtfPath(string fontName)
+        {
+            if (string.IsNullOrEmpty(fontName)) return null;
+
+            var dirs = new List<string>();
+            try
+            {
+                var winFonts = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Fonts");
+                if (Directory.Exists(winFonts)) dirs.Add(winFonts);
+                var userFonts = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Microsoft", "Windows", "Fonts");
+                if (Directory.Exists(userFonts)) dirs.Add(userFonts);
+                if (Directory.Exists("/usr/share/fonts")) dirs.Add("/usr/share/fonts");
+                if (Directory.Exists("/Library/Fonts")) dirs.Add("/Library/Fonts");
+            }
+            catch { }
+
+            // Build candidate filenames from the display name
+            // "Adobe Devanagari Italic" → try: "Adobe Devanagari Italic", "AdobeDevanagari-Italic",
+            //   "AdobeDevanagariItalic", "AdobeDevanagari-Italic", etc.
+            var candidates = BuildFilenameCandidates(fontName);
+
+            foreach (var dir in dirs)
+            {
+                // 1. Try exact candidates
+                foreach (var candidate in candidates)
+                {
+                    foreach (var ext in new[] { ".ttf", ".otf" })
+                    {
+                        var path = Path.Combine(dir, candidate + ext);
+                        if (File.Exists(path)) return path;
+                    }
+                }
+
+                // 2. Fuzzy match: scan all font files and compare normalized names
+                try
+                {
+                    string normalizedSearch = NormalizeFontName(fontName);
+                    foreach (var ext in new[] { "*.ttf", "*.otf" })
+                    {
+                        foreach (var file in Directory.GetFiles(dir, ext, SearchOption.AllDirectories))
+                        {
+                            string fileName = Path.GetFileNameWithoutExtension(file);
+                            if (string.Equals(NormalizeFontName(fileName), normalizedSearch,
+                                StringComparison.OrdinalIgnoreCase))
+                                return file;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Build candidate filenames from a font display name.
+        /// </summary>
+        private static string[] BuildFilenameCandidates(string displayName)
+        {
+            var candidates = new List<string>();
+            candidates.Add(displayName); // exact
+
+            // Split into name + style parts
+            // "Adobe Devanagari Bold Italic" → family="Adobe Devanagari", style="Bold Italic"
+            string[] styleSuffixes = { "Bold Italic", "Bold", "Italic", "Regular", "Light", "Medium",
+                "SemiBold", "ExtraBold", "Thin", "Black", "Condensed" };
+
+            string family = displayName;
+            string style = "";
+            foreach (var suffix in styleSuffixes)
+            {
+                if (displayName.EndsWith(" " + suffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    family = displayName.Substring(0, displayName.Length - suffix.Length - 1);
+                    style = suffix;
+                    break;
+                }
+            }
+
+            string familyNoSpaces = family.Replace(" ", "");
+            string styleNoSpaces = style.Replace(" ", "");
+
+            // "AdobeDevanagari-Italic"
+            if (!string.IsNullOrEmpty(style))
+            {
+                candidates.Add(familyNoSpaces + "-" + styleNoSpaces);
+                candidates.Add(familyNoSpaces + style);
+                candidates.Add(familyNoSpaces + "-" + style);
+            }
+            // "AdobeDevanagari-Regular" (when no style suffix detected)
+            candidates.Add(familyNoSpaces + "-Regular");
+            candidates.Add(familyNoSpaces);
+            candidates.Add(displayName.Replace(" ", ""));
+
+            return candidates.ToArray();
+        }
+
+        /// <summary>
+        /// Normalize a font name for fuzzy comparison: lowercase, strip spaces/hyphens/underscores.
+        /// "Adobe Devanagari Italic" and "AdobeDevanagari-Italic" both become "adobedevanagariitalic".
+        /// </summary>
+        private static string NormalizeFontName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "";
+            var sb = new System.Text.StringBuilder(name.Length);
+            for (int i = 0; i < name.Length; i++)
+            {
+                char c = name[i];
+                if (c != ' ' && c != '-' && c != '_')
+                    sb.Append(char.ToLowerInvariant(c));
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Rasterize a system font by name. Called as fallback when CreateDynamicFontFromOSFont fails.
+        /// Uses FontManager.GetSystemFontPath for proper name→path resolution.
+        /// Returns a TMP_FontAsset or null.
+        /// </summary>
+        public static object LoadSystemTtfFont(string fontName)
+        {
+            // Check if already rasterized (cached in _customFonts)
+            CustomFontInfo fontInfo;
+            if (_customFonts.TryGetValue(fontName, out fontInfo) && fontInfo.IsLoaded && fontInfo.FontAsset != null)
+                return fontInfo.FontAsset;
+
+            // Find the .ttf file path — FontManager has the name→path mapping
+            var ttfPath = FontManager.GetSystemFontPath(fontName);
+            if (ttfPath == null)
+            {
+                TranslatorCore.LogWarning($"[CustomFontLoader] System TTF not found: {fontName}");
+                return null;
+            }
+
+            TranslatorCore.LogInfo($"[CustomFontLoader] Resolved system font '{fontName}' -> {ttfPath}");
+
+            // Register as custom font with TTF path, then load via existing pipeline
+            if (!_customFonts.ContainsKey(fontName))
+            {
+                _customFonts[fontName] = new CustomFontInfo
+                {
+                    Name = fontName,
+                    TtfPath = ttfPath,
+                    Source = "system"
+                };
+            }
+
+            return LoadCustomFont(fontName);
+        }
+
+        /// <summary>
         /// Loads a custom font's texture and creates the TMP_FontAsset.
         /// Call this lazily when the font is actually needed.
         /// </summary>
         public static object LoadCustomFont(string fontName)
         {
-            if (!_customFonts.TryGetValue(fontName, out var fontInfo))
+            CustomFontInfo fontInfo;
+            if (!_customFonts.TryGetValue(fontName, out fontInfo))
             {
                 TranslatorCore.LogWarning($"[CustomFontLoader] Font not found: {fontName}");
                 return null;
@@ -213,23 +414,162 @@ namespace UnityGameTranslator.Core
                 return null;
             }
 
-            try
+            // TTF font not yet rasterized — do it now (on demand)
+            if (fontInfo.IsTtf && fontInfo.AtlasData == null && fontInfo.RgbaPixels == null)
             {
-                // Load PNG texture
-                var pngData = File.ReadAllBytes(fontInfo.PngPath);
-                var texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
-                texture.filterMode = FilterMode.Bilinear;
-
-                if (!LoadImageToTexture(texture, pngData))
+                TranslatorCore.LogInfo($"[CustomFontLoader] Rasterizing TTF on demand: {fontName}");
+                try
                 {
-                    fontInfo.Error = "Failed to load PNG";
-                    TranslatorCore.LogWarning($"[CustomFontLoader] Failed to load PNG for {fontName}");
+                    // Cache always goes in the mod's fonts/ folder
+                    string cacheDir = fontInfo.Source == "system" ? _cacheFolderPath : null;
+                    var cached = Rasterizer.TtfFontPipeline.TryLoadCache(fontInfo.TtfPath, cacheDir);
+                    if (cached == null)
+                    {
+                        cached = Rasterizer.TtfFontPipeline.ProcessTtfFont(fontInfo.TtfPath);
+                        if (cached != null)
+                        {
+                            // Ensure cache dir exists for system fonts
+                            if (cacheDir != null && !Directory.Exists(cacheDir))
+                                Directory.CreateDirectory(cacheDir);
+                            Rasterizer.TtfFontPipeline.SaveCache(fontInfo.TtfPath, cached, cacheDir);
+                        }
+                    }
+
+                    if (cached != null && cached.AtlasData?.glyphs != null && cached.AtlasData.glyphs.Count > 0)
+                    {
+                        fontInfo.AtlasData = cached.AtlasData;
+                        fontInfo.RgbaPixels = cached.RgbaPixels;
+                        fontInfo.RgbaWidth = cached.Width;
+                        fontInfo.RgbaHeight = cached.Height;
+                        TranslatorCore.LogInfo($"[CustomFontLoader] TTF rasterized: {fontName} " +
+                            $"({cached.AtlasData.glyphs.Count} glyphs, {cached.Width}x{cached.Height})");
+                    }
+                    else
+                    {
+                        fontInfo.Error = "TTF rasterization failed";
+                        TranslatorCore.LogWarning($"[CustomFontLoader] TTF rasterization failed: {fontName}");
+                        return null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    fontInfo.Error = $"TTF error: {ex.Message}";
+                    TranslatorCore.LogError($"[CustomFontLoader] TTF error for {fontName}: {ex}");
                     return null;
                 }
+            }
 
-                // For SDF fonts, the distance field is in RGB (grayscale) but TMP expects it in Alpha
-                // Convert by copying R channel to Alpha
-                ConvertSdfTextureForTMP(texture);
+            try
+            {
+                Texture2D texture;
+
+                if (fontInfo.RgbaPixels != null && fontInfo.RgbaWidth > 0 && fontInfo.RgbaHeight > 0)
+                {
+                    // TTF-rasterized font: create texture, save as real PNG for cache,
+                    // then reload via the same LoadImage path as JSON+PNG fonts
+                    int w = fontInfo.RgbaWidth;
+                    int h = fontInfo.RgbaHeight;
+                    var rgba = fontInfo.RgbaPixels;
+
+                    // Create temporary texture to encode as PNG
+                    // Flip: our RGBA is top-to-bottom, SetPixels32 expects bottom-to-top
+                    var tmpTex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                    var colors = new Color32[w * h];
+                    for (int row = 0; row < h; row++)
+                    {
+                        int srcRow = h - 1 - row;
+                        for (int col = 0; col < w; col++)
+                        {
+                            int srcIdx = (srcRow * w + col) * 4;
+                            colors[row * w + col] = new Color32(rgba[srcIdx], rgba[srcIdx + 1], rgba[srcIdx + 2], rgba[srcIdx + 3]);
+                        }
+                    }
+                    tmpTex.SetPixels32(colors);
+                    tmpTex.Apply();
+
+                    // Save as real PNG via EncodeToPNG (reflection for IL2CPP compatibility)
+                    string cacheDir = fontInfo.Source == "system" ? _cacheFolderPath : Path.GetDirectoryName(fontInfo.TtfPath ?? "");
+                    if (!string.IsNullOrEmpty(cacheDir))
+                    {
+                        if (!Directory.Exists(cacheDir))
+                            Directory.CreateDirectory(cacheDir);
+
+                        // Use .gen.png/.gen.json to distinguish from user-provided fonts
+                        string pngPath = Path.Combine(cacheDir, fontName + ".gen.png");
+                        string jsonPath = Path.Combine(cacheDir, fontName + ".gen.json");
+
+                        try
+                        {
+                            byte[] pngData = EncodeToPngSafe(tmpTex);
+                            if (pngData != null && pngData.Length > 0)
+                            {
+                                File.WriteAllBytes(pngPath, pngData);
+                                var json = Newtonsoft.Json.JsonConvert.SerializeObject(fontInfo.AtlasData, Newtonsoft.Json.Formatting.None);
+                                File.WriteAllText(jsonPath, json);
+
+                                // Switch to the JSON+PNG path: set PngPath and clear RGBA
+                                fontInfo.PngPath = pngPath;
+                                fontInfo.RgbaPixels = null;
+
+                                TranslatorCore.LogInfo($"[CustomFontLoader] Saved TTF atlas as PNG: {pngPath} ({pngData.Length} bytes)");
+                            }
+                            else
+                            {
+                                TranslatorCore.LogWarning("[CustomFontLoader] EncodeToPNG returned null/empty");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            TranslatorCore.LogWarning($"[CustomFontLoader] Failed to save PNG cache: {ex.Message}");
+                        }
+                    }
+
+                    UnityEngine.Object.Destroy(tmpTex);
+                    fontInfo.RgbaPixels = null;
+
+                    // Now load via the standard PNG path (same as JSON+PNG custom fonts)
+                    if (!string.IsNullOrEmpty(fontInfo.PngPath) && File.Exists(fontInfo.PngPath))
+                    {
+                        var pngBytes = File.ReadAllBytes(fontInfo.PngPath);
+                        texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                        texture.filterMode = FilterMode.Bilinear;
+
+                        if (!LoadImageToTexture(texture, pngBytes))
+                        {
+                            fontInfo.Error = "Failed to load cached PNG";
+                            TranslatorCore.LogWarning($"[CustomFontLoader] Failed to load cached PNG for {fontName}");
+                            return null;
+                        }
+
+                        // SDF is in alpha channel (R=G=B=255, A=SDF) — check if conversion needed
+                        ConvertSdfTextureForTMP(texture);
+                        TranslatorCore.LogInfo($"[CustomFontLoader] Loaded TTF atlas from PNG: {texture.width}x{texture.height}");
+                    }
+                    else
+                    {
+                        fontInfo.Error = "PNG cache not available";
+                        TranslatorCore.LogWarning($"[CustomFontLoader] No PNG cache for {fontName}");
+                        return null;
+                    }
+                }
+                else
+                {
+                    // JSON+PNG font: load from file
+                    var pngData = File.ReadAllBytes(fontInfo.PngPath);
+                    texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                    texture.filterMode = FilterMode.Bilinear;
+
+                    if (!LoadImageToTexture(texture, pngData))
+                    {
+                        fontInfo.Error = "Failed to load PNG";
+                        TranslatorCore.LogWarning($"[CustomFontLoader] Failed to load PNG for {fontName}");
+                        return null;
+                    }
+
+                    // For SDF fonts, the distance field is in RGB (grayscale) but TMP expects it in Alpha
+                    // Convert by copying R channel to Alpha
+                    ConvertSdfTextureForTMP(texture);
+                }
 
                 fontInfo.AtlasTexture = texture;
                 TranslatorCore.LogInfo($"[CustomFontLoader] Loaded texture: {texture.width}x{texture.height}, format: {texture.format}");
@@ -524,6 +864,31 @@ namespace UnityGameTranslator.Core
                 _tmpGlyphType = asm.GetType(ns + ".TMP_Glyph") ?? FindTypeByName(asm, "TMP_Glyph");
                 _tmpTextElementType = asm.GetType(ns + ".TMP_TextElement") ?? FindTypeByName(asm, "TMP_TextElement");
                 _faceInfoType = asm.GetType(ns + ".FaceInfo") ?? FindTypeByName(asm, "FaceInfo");
+
+                // FaceInfo may be in another assembly or have a different name on IL2CPP
+                if (_faceInfoType == null)
+                {
+                    // Try FaceInfo_Legacy in the TMP assembly (IL2CPP games with older TMP)
+                    _faceInfoType = asm.GetType(ns + ".FaceInfo_Legacy") ?? FindTypeByName(asm, "FaceInfo_Legacy");
+
+                    // Try UnityEngine.TextCoreModule (modern TMP versions)
+                    if (_faceInfoType == null)
+                    {
+                        foreach (var otherAsm in AppDomain.CurrentDomain.GetAssemblies())
+                        {
+                            if (otherAsm.GetName().Name.Contains("TextCore"))
+                            {
+                                _faceInfoType = otherAsm.GetType("UnityEngine.TextCore.FaceInfo")
+                                    ?? otherAsm.GetType("UnityEngine.TextCore.LowLevel.FaceInfo")
+                                    ?? FindTypeByName(otherAsm, "FaceInfo");
+                                if (_faceInfoType != null) break;
+                            }
+                        }
+                    }
+
+                    if (_faceInfoType != null)
+                        TranslatorCore.LogInfo($"[CustomFontLoader] Found FaceInfo: {_faceInfoType.FullName}");
+                }
 
                 TranslatorCore.LogInfo($"[CustomFontLoader] Using TypeHelper-resolved types from {asm.GetName().Name} (ns={ns})");
                 TranslatorCore.LogInfo($"[CustomFontLoader] FontAsset={_tmpFontAssetType.Name}, Glyph={_tmpGlyphType?.Name ?? "null"}, FaceInfo={_faceInfoType?.Name ?? "null"}");
@@ -983,14 +1348,49 @@ namespace UnityGameTranslator.Core
                     faceInfo = existingFaceInfo;
                     TranslatorCore.LogInfo($"[CustomFontLoader] Reusing existing FaceInfo type: {faceInfo.GetType().Name}");
                 }
-                else if (_faceInfoType != null)
-                {
-                    faceInfo = Activator.CreateInstance(_faceInfoType);
-                }
                 else
                 {
-                    TranslatorCore.LogWarning("[CustomFontLoader] FaceInfo type not found");
-                    return;
+                    // Determine the actual type expected by the fontAsset's m_fontInfo field/property
+                    Type actualFaceInfoType = null;
+                    if (fontInfoProp != null)
+                        actualFaceInfoType = fontInfoProp.PropertyType;
+                    else if (fontInfoField != null)
+                        actualFaceInfoType = fontInfoField.FieldType;
+
+                    // Try to create the correct type (FaceInfo_Legacy on IL2CPP, FaceInfo on Mono)
+                    if (actualFaceInfoType != null)
+                    {
+                        try
+                        {
+                            faceInfo = Activator.CreateInstance(actualFaceInfoType);
+                            TranslatorCore.LogInfo($"[CustomFontLoader] Created FaceInfo from field type: {actualFaceInfoType.FullName}");
+                        }
+                        catch
+                        {
+                            faceInfo = null;
+                        }
+                    }
+                    else if (_faceInfoType != null)
+                    {
+                        try
+                        {
+                            faceInfo = Activator.CreateInstance(_faceInfoType);
+                        }
+                        catch
+                        {
+                            faceInfo = null;
+                        }
+                    }
+                    else
+                    {
+                        faceInfo = null;
+                    }
+
+                    if (faceInfo == null)
+                    {
+                        TranslatorCore.LogWarning("[CustomFontLoader] FaceInfo type not found or cannot be instantiated");
+                        return;
+                    }
                 }
 
                 // Set fields using reflection (names may vary between TMP versions)
@@ -1583,6 +1983,72 @@ namespace UnityGameTranslator.Core
         /// Loads image data into a Texture2D using reflection to call ImageConversion.LoadImage.
         /// This avoids compile-time dependency on ImageConversionModule.
         /// </summary>
+        /// <summary>
+        /// Encode a Texture2D to PNG via reflection (handles IL2CPP where EncodeToPNG may differ).
+        /// </summary>
+        private static byte[] EncodeToPngSafe(Texture2D texture)
+        {
+            if (texture == null) return null;
+
+            // Try ImageConversion.EncodeToPNG(texture) — newer Unity
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var imageConvType = asm.GetType("UnityEngine.ImageConversion");
+                if (imageConvType == null) continue;
+
+                foreach (var method in imageConvType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                {
+                    if (method.Name != "EncodeToPNG") continue;
+                    var parameters = method.GetParameters();
+                    if (parameters.Length == 1)
+                    {
+                        try
+                        {
+                            var result = method.Invoke(null, new object[] { texture });
+                            if (result is byte[] bytes) return bytes;
+
+                            // IL2CPP: might return Il2CppStructArray<byte>
+                            if (result != null)
+                            {
+                                var resultType = result.GetType();
+                                var lengthProp = resultType.GetProperty("Length") ?? resultType.GetProperty("Count");
+                                if (lengthProp != null)
+                                {
+                                    int length = (int)lengthProp.GetValue(result, null);
+                                    var indexer = resultType.GetProperty("Item");
+                                    if (indexer != null && length > 0)
+                                    {
+                                        byte[] data = new byte[length];
+                                        for (int i = 0; i < length; i++)
+                                            data[i] = (byte)indexer.GetValue(result, new object[] { i });
+                                        return data;
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            TranslatorCore.LogWarning($"[CustomFontLoader] EncodeToPNG failed: {ex.Message}");
+                        }
+                    }
+                }
+            }
+
+            // Try Texture2D.EncodeToPNG() — older Unity (instance method)
+            try
+            {
+                var method = texture.GetType().GetMethod("EncodeToPNG", BindingFlags.Public | BindingFlags.Instance);
+                if (method != null)
+                {
+                    var result = method.Invoke(texture, null);
+                    if (result is byte[] bytes) return bytes;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
         private static bool LoadImageToTexture(Texture2D texture, byte[] data)
         {
             if (texture == null || data == null || data.Length == 0)
@@ -1928,15 +2394,9 @@ namespace UnityGameTranslator.Core
 
             var type = texture.GetType();
 
-            // Try direct call first (works on Mono)
-            try
-            {
-                texture.LoadRawTextureData(data);
-                return true;
-            }
-            catch { }
-
-            // IL2CPP: try via reflection, find a LoadRawTextureData that accepts our data
+            // Always use reflection to avoid MissingMethodException on IL2CPP
+            // (direct call to LoadRawTextureData(byte[]) crashes on IL2CPP with unstripped methods)
+            // Try via reflection, find a LoadRawTextureData that accepts our data
             foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance))
             {
                 if (method.Name != "LoadRawTextureData") continue;

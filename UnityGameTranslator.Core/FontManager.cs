@@ -45,6 +45,9 @@ namespace UnityGameTranslator.Core
         // Cache of system fonts
         private static string[] _systemFonts;
 
+        // Mapping: font display name → TTF file path (built from GetOSInstalledFontNames + GetPathsToOSFonts)
+        private static Dictionary<string, string> _systemFontPaths;
+
         /// <summary>
         /// Gets all detected TMP font names from the game.
         /// </summary>
@@ -72,19 +75,51 @@ namespace UnityGameTranslator.Core
 
         /// <summary>
         /// Safely get installed font names via reflection.
-        /// Font.GetOSInstalledFontNames() doesn't exist in all Unity versions/runtimes.
+        /// Also builds a name→path mapping using GetPathsToOSFonts (Unity 2019.1+).
+        /// Falls back to filesystem scan when APIs are unavailable (IL2CPP, old Unity).
         /// </summary>
         private static string[] TryGetOSInstalledFontNames()
         {
+            _systemFontPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
             try
             {
-                var method = typeof(Font).GetMethod("GetOSInstalledFontNames",
+                var namesMethod = typeof(Font).GetMethod("GetOSInstalledFontNames",
                     BindingFlags.Public | BindingFlags.Static);
-                if (method != null)
+                if (namesMethod != null)
                 {
-                    var result = method.Invoke(null, null) as string[];
-                    if (result != null && result.Length > 0)
-                        return result;
+                    var names = namesMethod.Invoke(null, null) as string[];
+                    if (names != null && names.Length > 0)
+                    {
+                        // Try GetPathsToOSFonts (Unity 2019.1+) — same order as names
+                        try
+                        {
+                            var pathsMethod = typeof(Font).GetMethod("GetPathsToOSFonts",
+                                BindingFlags.Public | BindingFlags.Static);
+                            if (pathsMethod != null)
+                            {
+                                var paths = pathsMethod.Invoke(null, null) as string[];
+                                if (paths != null && paths.Length == names.Length)
+                                {
+                                    for (int i = 0; i < names.Length; i++)
+                                    {
+                                        if (!string.IsNullOrEmpty(names[i]) && !string.IsNullOrEmpty(paths[i]))
+                                        {
+                                            if (!_systemFontPaths.ContainsKey(names[i]))
+                                                _systemFontPaths[names[i]] = paths[i];
+                                        }
+                                    }
+                                    TranslatorCore.LogInfo($"[FontManager] Built font path mapping: {_systemFontPaths.Count} entries");
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            TranslatorCore.LogInfo($"[FontManager] GetPathsToOSFonts unavailable: {ex.Message}");
+                        }
+
+                        return names;
+                    }
                 }
                 TranslatorCore.LogInfo("[FontManager] GetOSInstalledFontNames returned empty, trying filesystem fallback");
             }
@@ -95,6 +130,26 @@ namespace UnityGameTranslator.Core
 
             // Filesystem fallback for IL2CPP or older Unity
             return TryGetFontNamesFromFilesystem();
+        }
+
+        /// <summary>
+        /// Get the TTF file path for a system font name.
+        /// Uses the name→path mapping from GetPathsToOSFonts, then filesystem scan fallback.
+        /// </summary>
+        public static string GetSystemFontPath(string fontName)
+        {
+            if (string.IsNullOrEmpty(fontName)) return null;
+
+            // Ensure system fonts are loaded (triggers TryGetOSInstalledFontNames)
+            var _ = SystemFonts;
+
+            // 1. Direct lookup from GetPathsToOSFonts mapping
+            string path;
+            if (_systemFontPaths != null && _systemFontPaths.TryGetValue(fontName, out path))
+                return path;
+
+            // 2. Fallback: search filesystem by normalized name
+            return CustomFontLoader.FindSystemTtfPath(fontName);
         }
 
         /// <summary>
@@ -999,6 +1054,14 @@ namespace UnityGameTranslator.Core
                     return legacyAsset;
                 }
 
+                // Last resort: try TTF rasterizer (finds the .ttf on disk and rasterizes to SDF)
+                var rasterizedAsset = CustomFontLoader.LoadSystemTtfFont(cleanName);
+                if (rasterizedAsset != null)
+                {
+                    TranslatorCore.LogInfo($"[FontManager] Created TMP_FontAsset via TTF rasterizer: {cleanName}");
+                    return rasterizedAsset;
+                }
+
                 TranslatorCore.LogWarning($"[FontManager] All font creation methods failed for: {cleanName}");
                 return null;
             }
@@ -1832,17 +1895,16 @@ namespace UnityGameTranslator.Core
             if (string.IsNullOrEmpty(fontName))
                 return false;
 
-            // Check if it has the [Custom] prefix
             if (fontName.StartsWith("[Custom] "))
                 return true;
 
-            // Check if it's in the custom fonts list
             var customFonts = CustomFontLoader.CustomFonts;
             return customFonts.ContainsKey(fontName);
         }
 
         /// <summary>
         /// Gets or loads a custom font asset by name.
+        /// Handles both custom fonts and system TTF fonts.
         /// </summary>
         public static object GetCustomFontAsset(string fontName)
         {
