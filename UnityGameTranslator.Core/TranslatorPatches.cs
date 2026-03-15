@@ -1616,16 +1616,19 @@ namespace UnityGameTranslator.Core
                             var replacementFont = FontManager.GetUnityReplacementFont(settingsFontName);
                             if (replacementFont != null)
                             {
-                                // Track original font (same pattern as TMP)
                                 int instId = TypeHelper.GetInstanceID(__instance);
                                 if (instId != -1)
                                     FontManager.TrackOriginalFont(instId, fontObj);
 
-                                // Don't re-apply if already replaced with the right font
                                 string currentName = (fontObj is UnityEngine.Object co) ? co.name : null;
                                 string replaceName = replacementFont.name;
                                 if (currentName != replaceName)
                                     TypeHelper.SetFont(__instance, replacementFont);
+                            }
+                            else if (FontManager.HasFallbackConfigured(settingsFontName))
+                            {
+                                // Unity Font creation failed (IL2CPP) — try converting to TMP
+                                FontManager.ConvertUITextToTMP(comp, settingsFontName, textValue);
                             }
                         }
                     }

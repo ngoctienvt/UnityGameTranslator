@@ -685,6 +685,16 @@ namespace UnityGameTranslator.Core
 
                 TranslatorCore.LogInfo($"[CustomFontLoader] characterInfo set={ciSet}, length={ciWriteIdx}");
 
+                // If characterInfo assignment failed, this font is unusable — return null
+                // so the caller can fall back to UI.Text → TMP conversion
+                if (!ciSet)
+                {
+                    TranslatorCore.LogWarning("[CustomFontLoader] CharacterInfo not supported on this runtime — font unusable");
+                    if (font is UnityEngine.Object fontToDestroy)
+                        UnityEngine.Object.Destroy(fontToDestroy);
+                    return null;
+                }
+
                 // Verify: read back characterInfo and inspect first element
                 var readBack = GetPropertyOrField(font, fontType, "characterInfo");
                 if (readBack != null)

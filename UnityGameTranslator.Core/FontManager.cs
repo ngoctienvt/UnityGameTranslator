@@ -833,6 +833,271 @@ namespace UnityGameTranslator.Core
         /// Remove fallback from a font and clear the applied cache.
         /// Call when fallback settings change.
         /// </summary>
+        // Track which GameObjects have been converted from UI.Text to TMP
+        private static readonly HashSet<int> _convertedToTMP = new HashSet<int>();
+
+        /// <summary>
+        /// Check if a font has a fallback configured in settings.
+        /// </summary>
+        public static bool HasFallbackConfigured(string fontName)
+        {
+            if (string.IsNullOrEmpty(fontName)) return false;
+            if (!TranslatorCore.FontSettingsMap.TryGetValue(fontName, out var settings)) return false;
+            return !string.IsNullOrEmpty(settings.fallback);
+        }
+
+        /// <summary>
+        /// Convert a UI.Text component to TextMeshProUGUI with a custom TMP font.
+        /// Used on IL2CPP where creating a Unity Font with CharacterInfo is impossible.
+        /// Disables the original UI.Text and adds a TMP component with the rasterized font.
+        /// </summary>
+        public static void ConvertUITextToTMP(Component uiTextComponent, string originalFontName, string currentText)
+        {
+            if (uiTextComponent == null) return;
+
+            var go = uiTextComponent.gameObject;
+            int goId = go.GetInstanceID();
+
+            // Don't convert twice
+            if (_convertedToTMP.Contains(goId)) return;
+
+            TranslatorCore.LogInfo($"[FontManager] ConvertUITextToTMP called: go='{go.name}', font='{originalFontName}'");
+
+            // Check if a fallback is configured
+            if (!TranslatorCore.FontSettingsMap.TryGetValue(originalFontName, out var settings))
+                return;
+            if (string.IsNullOrEmpty(settings.fallback))
+                return;
+
+            // Get the TMP font asset (via the existing TMP pipeline — works on IL2CPP)
+            string cleanFallback = settings.fallback;
+            if (cleanFallback.StartsWith("[Custom] "))
+                cleanFallback = cleanFallback.Substring(9);
+
+            object tmpFontAsset = null;
+
+            // Try custom font first
+            if (IsCustomFont(cleanFallback))
+                tmpFontAsset = CustomFontLoader.LoadCustomFont(cleanFallback);
+
+            // Try system font via TTF rasterizer
+            if (tmpFontAsset == null)
+                tmpFontAsset = CustomFontLoader.LoadSystemTtfFont(cleanFallback);
+
+            if (tmpFontAsset == null)
+            {
+                // Try CreateFallbackAsset (covers all paths including game fonts)
+                if (!_fallbackAssets.TryGetValue(settings.fallback, out tmpFontAsset))
+                {
+                    tmpFontAsset = CreateFallbackAsset(settings.fallback);
+                    if (tmpFontAsset != null)
+                        _fallbackAssets[settings.fallback] = tmpFontAsset;
+                }
+            }
+
+            if (tmpFontAsset == null) return;
+
+            try
+            {
+                // Get text properties from the UI.Text component before disabling
+                var textComp = uiTextComponent;
+                var textType = textComp.GetType();
+
+                string text = currentText;
+                Color color = Color.white;
+                int fontSize = 14;
+                int alignment = 0; // TextAnchor
+
+                try
+                {
+                    var colorProp = textType.GetProperty("color", BindingFlags.Public | BindingFlags.Instance);
+                    if (colorProp != null) color = (Color)colorProp.GetValue(textComp, null);
+                }
+                catch { }
+
+                try
+                {
+                    var sizeProp = textType.GetProperty("fontSize", BindingFlags.Public | BindingFlags.Instance);
+                    if (sizeProp != null) fontSize = (int)sizeProp.GetValue(textComp, null);
+                }
+                catch { }
+
+                try
+                {
+                    var alignProp = textType.GetProperty("alignment", BindingFlags.Public | BindingFlags.Instance);
+                    if (alignProp != null) alignment = (int)alignProp.GetValue(textComp, null);
+                }
+                catch { }
+
+                // Disable the UI.Text component
+                try
+                {
+                    var enabledProp = textType.GetProperty("enabled", BindingFlags.Public | BindingFlags.Instance);
+                    if (enabledProp != null)
+                        enabledProp.SetValue(textComp, false, null);
+                }
+                catch { }
+
+                // Add TextMeshProUGUI component to the same GameObject
+                var tmpTextType = TypeHelper.TMP_TextType;
+                if (tmpTextType == null)
+                {
+                    TranslatorCore.LogWarning("[FontManager] TMP_Text type not found, cannot convert UI.Text to TMP");
+                    return;
+                }
+
+                // Find TextMeshProUGUI type (subclass of TMP_Text for uGUI)
+                Type tmproUGUIType = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    tmproUGUIType = asm.GetType("TMPro.TextMeshProUGUI")
+                        ?? asm.GetType("Il2CppTMPro.TextMeshProUGUI");
+                    if (tmproUGUIType != null) break;
+                }
+
+                if (tmproUGUIType == null)
+                {
+                    TranslatorCore.LogWarning("[FontManager] TextMeshProUGUI type not found");
+                    return;
+                }
+
+                // AddComponent<TextMeshProUGUI>() — try multiple approaches for IL2CPP compatibility
+                object tmpComponent = null;
+
+                // ALL via reflection — direct calls crash IL2CPP JIT
+
+                // Approach 1: Generic AddComponent<T>() via reflection
+                try
+                {
+                    foreach (var m in typeof(GameObject).GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                    {
+                        if (m.Name != "AddComponent") continue;
+                        if (!m.IsGenericMethodDefinition) continue;
+                        if (m.GetGenericArguments().Length != 1) continue;
+                        if (m.GetParameters().Length != 0) continue;
+
+                        var specific = m.MakeGenericMethod(tmproUGUIType);
+                        tmpComponent = specific.Invoke(go, null);
+                        if (tmpComponent != null)
+                        {
+                            TranslatorCore.LogInfo("[FontManager] Added TMP component via generic AddComponent<T>()");
+                            break;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    TranslatorCore.LogWarning($"[FontManager] Generic AddComponent failed: {ex.Message}");
+                }
+
+                // Approach 2: IL2CPP — AddComponent(Il2CppSystem.Type)
+                if (tmpComponent == null)
+                {
+                    try
+                    {
+                        // Get Il2CppType for TextMeshProUGUI
+                        object il2cppType = null;
+                        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                        {
+                            var il2cppTypeClass = asm.GetType("Il2CppInterop.Runtime.Il2CppType")
+                                ?? asm.GetType("UnhollowerRuntimeLib.Il2CppType");
+                            if (il2cppTypeClass == null) continue;
+
+                            // Try Il2CppType.From(Type)
+                            foreach (var fromM in il2cppTypeClass.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                            {
+                                if (fromM.Name != "From" && fromM.Name != "Of") continue;
+                                var pars = fromM.GetParameters();
+                                if (pars.Length == 1 && pars[0].ParameterType == typeof(Type))
+                                {
+                                    il2cppType = fromM.Invoke(null, new object[] { tmproUGUIType });
+                                    break;
+                                }
+                                if (pars.Length == 0 && fromM.IsGenericMethodDefinition)
+                                {
+                                    il2cppType = fromM.MakeGenericMethod(tmproUGUIType).Invoke(null, null);
+                                    break;
+                                }
+                            }
+                            if (il2cppType != null) break;
+                        }
+
+                        if (il2cppType != null)
+                        {
+                            foreach (var m in typeof(GameObject).GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                            {
+                                if (m.Name != "AddComponent") continue;
+                                if (m.IsGenericMethodDefinition) continue;
+                                var pars = m.GetParameters();
+                                if (pars.Length != 1) continue;
+                                if (!pars[0].ParameterType.IsAssignableFrom(il2cppType.GetType())) continue;
+
+                                tmpComponent = m.Invoke(go, new object[] { il2cppType });
+                                if (tmpComponent != null)
+                                {
+                                    TranslatorCore.LogInfo("[FontManager] Added TMP component via Il2CppType");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        TranslatorCore.LogWarning($"[FontManager] IL2CPP AddComponent failed: {ex.Message}");
+                    }
+                }
+
+                if (tmpComponent == null)
+                {
+                    // Only log once per font to avoid spam
+                    if (!_convertedToTMP.Contains(goId))
+                    {
+                        TranslatorCore.LogWarning("[FontManager] Cannot add TextMeshProUGUI component on this runtime");
+                        _convertedToTMP.Add(goId); // Prevent retrying
+                    }
+                    return;
+                }
+
+                // Set font
+                TypeHelper.SetFont(tmpComponent, tmpFontAsset);
+                SetFontSharedMaterial(tmpComponent, tmpFontAsset);
+
+                // Set text
+                var tmpCompType = tmpComponent.GetType();
+                try
+                {
+                    var textProp = tmpCompType.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
+                    if (textProp != null) textProp.SetValue(tmpComponent, text, null);
+                }
+                catch { }
+
+                // Set color
+                try
+                {
+                    var colorProp = tmpCompType.GetProperty("color", BindingFlags.Public | BindingFlags.Instance);
+                    if (colorProp != null) colorProp.SetValue(tmpComponent, color, null);
+                }
+                catch { }
+
+                // Set font size
+                try
+                {
+                    var sizeProp = tmpCompType.GetProperty("fontSize", BindingFlags.Public | BindingFlags.Instance);
+                    if (sizeProp != null) sizeProp.SetValue(tmpComponent, (float)fontSize, null);
+                }
+                catch { }
+
+                _convertedToTMP.Add(goId);
+                _createdFallbackFontNames.Add(cleanFallback);
+
+                TranslatorCore.LogInfo($"[FontManager] Converted UI.Text to TMP on '{go.name}': font='{cleanFallback}', size={fontSize}");
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogError($"[FontManager] ConvertUITextToTMP error: {ex.Message}");
+            }
+        }
+
         /// <summary>
         /// Get the replacement font for a Unity Font (UI.Text).
         /// Returns null if no fallback is configured.
