@@ -148,7 +148,7 @@ namespace UnityGameTranslator.BepInEx6IL2CPP
             if (currentTime - lastScanTime > 0.2f)
             {
                 lastScanTime = currentTime;
-                TranslatorScanner.ScanIL2CPP();
+                TranslatorScanner.Scan();
             }
         }
 

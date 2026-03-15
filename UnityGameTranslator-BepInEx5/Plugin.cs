@@ -66,7 +66,7 @@ namespace UnityGameTranslator.BepInEx5
             if (currentTime - lastScanTime > 0.2f)
             {
                 lastScanTime = currentTime;
-                TranslatorScanner.ScanMono();
+                TranslatorScanner.Scan();
             }
         }
 

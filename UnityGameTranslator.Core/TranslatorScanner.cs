@@ -7,7 +7,7 @@ namespace UnityGameTranslator.Core
 {
     /// <summary>
     /// Handles component scanning for both Mono and IL2CPP runtimes.
-    /// Optimized for minimal per-frame overhead.
+    /// Uses a unified RegisteredTextType system to eliminate Mono/IL2CPP code duplication.
     /// </summary>
     public static class TranslatorScanner
     {
@@ -19,33 +19,65 @@ namespace UnityGameTranslator.Core
         private static bool il2cppMethodsInitialized = false;
         private static bool il2cppScanAvailable = false;
 
-        // Cached generic methods (avoid MakeGenericMethod every call)
-        private static MethodInfo tryCastTMPMethod;
-        private static MethodInfo tryCastTextMethod;
-        private static object il2cppTypeTMP;
-        private static object il2cppTypeText;
-
         #endregion
 
-        #region Component Cache
+        #region Registered Types
 
-        // Cache found components to avoid FindObjectsOfTypeAll every frame
-        private static UnityEngine.Object[] cachedTMPComponents;
-        private static UnityEngine.Object[] cachedUIComponents;
-        private static UnityEngine.Object[] cachedTMPMono;
-        private static UnityEngine.Object[] cachedUIMono;
-        private static float lastComponentCacheTime = 0f;
-        private const float COMPONENT_CACHE_DURATION = 2f; // Minimum time between cache refreshes
-        private static bool cacheRefreshPending = false; // Defer refresh until cycle completes
+        // Unified list of all text component types to scan
+        private static readonly List<RegisteredTextType> _registeredTypes = new List<RegisteredTextType>();
+        private static bool _typesRegistered = false;
+
+        /// <summary>
+        /// Register a type for scanning. Called by RegisterBuiltInTypes and TranslatorPatches.
+        /// </summary>
+        public static void RegisterType(RegisteredTextType type)
+        {
+            if (type == null || type.ComponentType == null) return;
+
+            // Avoid duplicate registration
+            foreach (var existing in _registeredTypes)
+            {
+                if (existing.ComponentType == type.ComponentType)
+                    return;
+            }
+
+            // Set up IL2CPP cache for this type if available
+            if (il2cppScanAvailable && il2cppTypeOfMethod != null)
+            {
+                try
+                {
+                    type.IL2CPPType = il2cppTypeOfMethod.MakeGenericMethod(type.ComponentType).Invoke(null, null);
+                }
+                catch { }
+
+                if (tryCastMethod != null)
+                {
+                    try
+                    {
+                        type.TryCastMethod = tryCastMethod.MakeGenericMethod(type.ComponentType);
+                    }
+                    catch { }
+                }
+            }
+
+            _registeredTypes.Add(type);
+            TranslatorCore.LogInfo($"[Scanner] Registered type: {type.Name} (Category={type.Category})");
+        }
 
         #endregion
 
         #region Batch Processing
 
-        private static int currentBatchIndexTMP = 0;
-        private static int currentBatchIndexUI = 0;
         private const int BATCH_SIZE = 200; // Process 200 components per scan cycle
-        private static bool scanCycleComplete = true; // True when we've scanned all components
+        private static bool scanCycleComplete = true;
+
+        #endregion
+
+        #region Component Cache
+
+        private static float lastComponentCacheTime = 0f;
+        private const float COMPONENT_CACHE_DURATION = 2f;
+        private static bool cacheRefreshPending = false;
 
         #endregion
 
@@ -58,19 +90,12 @@ namespace UnityGameTranslator.Core
         // Track InputField text components (user input, not placeholder) - never translate these
         private static HashSet<int> inputFieldTextIds = new HashSet<int>();
 
-        // Track components that are part of our own UI (UniverseLib/UnityGameTranslator) - never translate
-        private static HashSet<int> ownUIComponentIds = new HashSet<int>();
-
         // Track original text per component (before translation was applied)
         // Key: component InstanceID, Value: original text before translation
         // Used to restore originals when translations are disabled at runtime
         private static Dictionary<int, string> componentOriginals = new Dictionary<int, string>();
 
         #endregion
-
-        // Logging flags (one-time)
-        private static bool scanLoggedTMP = false;
-        private static bool scanLoggedUI = false;
 
         #region Pending Updates Queue (thread-safe)
 
@@ -92,28 +117,20 @@ namespace UnityGameTranslator.Core
         /// </summary>
         public static void OnSceneChange()
         {
-            cachedTMPComponents = null;
-            cachedUIComponents = null;
-            cachedTMPMono = null;
-            cachedUIMono = null;
             lastComponentCacheTime = 0f;
-            currentBatchIndexTMP = 0;
-            currentBatchIndexUI = 0;
-            il2cppMonoBatchIndexTMP = 0;
-            il2cppMonoBatchIndexUI = 0;
             scanCycleComplete = true;
             cacheRefreshPending = false;
             processedTextHashes.Clear();
             inputFieldTextIds.Clear();
-            componentOriginals.Clear();  // Clear original text tracking (components are invalid after scene change)
-            scanLoggedTMP = false;
-            scanLoggedUI = false;
-            il2cppMonoLoggedTMP = false;
-            il2cppMonoLoggedUI = false;
-            _genericTextCaches.Clear();
-            _genericTextBatchIndices.Clear();
-            _genericTextLoggedOnce = false;
-            inputFieldDebugLogCount = 0;
+            componentOriginals.Clear();
+
+            // Clear all per-type caches
+            foreach (var type in _registeredTypes)
+            {
+                type.CachedComponents = null;
+                type.BatchIndex = 0;
+                type.LoggedOnce = false;
+            }
 
             // Clear pending updates (components from old scene are invalid)
             lock (pendingUpdatesLock)
@@ -130,19 +147,17 @@ namespace UnityGameTranslator.Core
         {
             try
             {
-                // Always refresh Mono caches (FindAllObjectsOfType works on IL2CPP via TypeHelper)
-                RefreshMonoCache();
+                if (!_typesRegistered) RegisterBuiltInTypes();
 
-                if (TranslatorCore.Adapter?.IsIL2CPP == true)
+                int total = 0;
+                foreach (var type in _registeredTypes)
                 {
-                    // Also refresh IL2CPP-specific caches for the scan loop
-                    RefreshIL2CPPCache();
+                    type.CachedComponents = RefreshTypeCache(type);
+                    total += type.CachedComponents?.Length ?? 0;
                 }
 
                 lastComponentCacheTime = Time.time;
-                int tmpCount = (cachedTMPMono?.Length ?? 0) + (cachedTMPComponents?.Length ?? 0);
-                int uiCount = (cachedUIMono?.Length ?? 0) + (cachedUIComponents?.Length ?? 0);
-                TranslatorCore.LogInfo($"[Scanner] Force refreshed cache: {tmpCount} TMP, {uiCount} UI.Text");
+                TranslatorCore.LogInfo($"[Scanner] Force refreshed cache: {total} total components across {_registeredTypes.Count} types");
             }
             catch (Exception ex)
             {
@@ -157,128 +172,773 @@ namespace UnityGameTranslator.Core
         {
             processedTextHashes.Clear();
             // Reset batch indices to start fresh
-            currentBatchIndexTMP = 0;
-            currentBatchIndexUI = 0;
+            foreach (var type in _registeredTypes)
+            {
+                type.BatchIndex = 0;
+            }
             scanCycleComplete = true;
         }
+
+        #region Unified Scan
+
+        /// <summary>
+        /// Unified scan method - replaces ScanMono() and ScanIL2CPP().
+        /// Works for both Mono and IL2CPP runtimes.
+        /// </summary>
+        public static void Scan()
+        {
+            // Apply any pending translations from AI (main thread) - always do this
+            ProcessPendingUpdates();
+
+            // Register types on first invocation (after TypeHelper.Initialize() + InitializeIL2CPP())
+            if (!_typesRegistered) RegisterBuiltInTypes();
+
+            // Skip scanning if there's no useful work to do
+            if (ShouldSkipScanning())
+                return;
+
+            float currentTime = Time.realtimeSinceStartup;
+
+            // Check if cache refresh is needed
+            bool needsRefresh = (currentTime - lastComponentCacheTime > COMPONENT_CACHE_DURATION);
+
+            // Some types may have null caches on first run
+            if (!needsRefresh)
+            {
+                foreach (var type in _registeredTypes)
+                {
+                    if (type.CachedComponents == null)
+                    {
+                        needsRefresh = true;
+                        break;
+                    }
+                }
+            }
+
+            if (needsRefresh)
+            {
+                if (scanCycleComplete)
+                {
+                    RefreshAllCaches();
+                    lastComponentCacheTime = currentTime;
+                    cacheRefreshPending = false;
+                }
+                else
+                {
+                    cacheRefreshPending = true;
+                }
+            }
+
+            if (cacheRefreshPending && scanCycleComplete)
+            {
+                RefreshAllCaches();
+                lastComponentCacheTime = currentTime;
+                cacheRefreshPending = false;
+            }
+
+            try
+            {
+                bool allDone = true;
+                foreach (var type in _registeredTypes)
+                {
+                    if (type.CachedComponents == null || type.CachedComponents.Length == 0) continue;
+                    bool typeDone = ProcessBatch(type);
+                    if (!typeDone) allDone = false;
+                }
+                scanCycleComplete = allDone;
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Refresh caches for all registered types.
+        /// </summary>
+        private static void RefreshAllCaches()
+        {
+            foreach (var type in _registeredTypes)
+            {
+                type.CachedComponents = RefreshTypeCache(type);
+                if (!type.LoggedOnce && type.CachedComponents != null && type.CachedComponents.Length > 0)
+                {
+                    TranslatorCore.LogInfo($"Scan: Found {type.CachedComponents.Length} {type.Name} components");
+                    type.LoggedOnce = true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Process a batch of components for a registered type.
+        /// Returns true when the full array has been processed (cycle complete for this type).
+        /// </summary>
+        private static bool ProcessBatch(RegisteredTextType type)
+        {
+            if (type.BatchIndex >= type.CachedComponents.Length)
+                type.BatchIndex = 0;
+
+            int endIndex = Math.Min(type.BatchIndex + BATCH_SIZE, type.CachedComponents.Length);
+
+            for (int i = type.BatchIndex; i < endIndex; i++)
+            {
+                var obj = type.CachedComponents[i];
+                if (obj == null) continue;
+
+                // For IL2CPP native scan results, need TryCast
+                if (type.TryCastMethod != null && TranslatorCore.Adapter?.IsIL2CPP == true)
+                {
+                    // Check if already the right type
+                    if (!type.ComponentType.IsInstanceOfType(obj))
+                    {
+                        var cast = TryCastToType(obj, type.TryCastMethod);
+                        if (cast != null)
+                        {
+                            ProcessComponentForType(cast, type);
+                        }
+                        continue;
+                    }
+                }
+
+                ProcessComponentForType(obj, type);
+            }
+
+            if (endIndex >= type.CachedComponents.Length)
+            {
+                type.BatchIndex = 0;
+                return true;
+            }
+            else
+            {
+                type.BatchIndex = endIndex;
+                return false;
+            }
+        }
+
+        #endregion
+
+        #region Type Registration
+
+        /// <summary>
+        /// Register built-in text types (TMP, UI.Text, TextMesh) and generic types from TranslatorPatches.
+        /// Called on first Scan() invocation, after TypeHelper.Initialize() and InitializeIL2CPP().
+        /// </summary>
+        private static void RegisterBuiltInTypes()
+        {
+            _typesRegistered = true;
+
+            // Ensure IL2CPP is initialized for IL2CPP runtimes
+            if (TranslatorCore.Adapter?.IsIL2CPP == true && !il2cppMethodsInitialized)
+                InitializeIL2CPP();
+
+            var pubInst = BindingFlags.Public | BindingFlags.Instance;
+
+            // TMP_Text (base type)
+            if (TypeHelper.TMP_TextType != null)
+            {
+                RegisterType(new RegisteredTextType
+                {
+                    Name = TypeHelper.TMP_TextType.Name,
+                    Category = "TMP",
+                    ComponentType = TypeHelper.TMP_TextType,
+                    TextProp = TypeHelper.TMP_TextProp,
+                    FontProp = TypeHelper.TMP_FontProp,
+                    FontSizeProp = TypeHelper.TMP_FontSizeProp,
+                    ColorProp = TypeHelper.TMP_TextType.GetProperty("color", pubInst),
+                    FontTypeName = "TMP",
+                    NeedsForceMeshUpdate = true,
+                    NeedsSetAllDirty = false
+                });
+
+                // TextMeshProUGUI - register only if different from TMP_TextType
+                Type tmproUGUI = FindType("TMPro.TextMeshProUGUI");
+                if (tmproUGUI != null && tmproUGUI != TypeHelper.TMP_TextType)
+                {
+                    RegisterType(new RegisteredTextType
+                    {
+                        Name = "TextMeshProUGUI",
+                        Category = "TMP",
+                        ComponentType = tmproUGUI,
+                        TextProp = tmproUGUI.GetProperty("text", pubInst),
+                        FontProp = tmproUGUI.GetProperty("font", pubInst),
+                        FontSizeProp = tmproUGUI.GetProperty("fontSize", pubInst),
+                        ColorProp = tmproUGUI.GetProperty("color", pubInst),
+                        FontTypeName = "TMP",
+                        NeedsForceMeshUpdate = true,
+                        NeedsSetAllDirty = false
+                    });
+                }
+
+                // TextMeshPro (3D) - register only if different from TMP_TextType
+                Type tmproPro = FindType("TMPro.TextMeshPro");
+                if (tmproPro != null && tmproPro != TypeHelper.TMP_TextType && tmproPro != tmproUGUI)
+                {
+                    RegisterType(new RegisteredTextType
+                    {
+                        Name = "TextMeshPro",
+                        Category = "TMP",
+                        ComponentType = tmproPro,
+                        TextProp = tmproPro.GetProperty("text", pubInst),
+                        FontProp = tmproPro.GetProperty("font", pubInst),
+                        FontSizeProp = tmproPro.GetProperty("fontSize", pubInst),
+                        ColorProp = tmproPro.GetProperty("color", pubInst),
+                        FontTypeName = "TMP",
+                        NeedsForceMeshUpdate = true,
+                        NeedsSetAllDirty = false
+                    });
+                }
+            }
+
+            // UI.Text
+            if (TypeHelper.UI_TextType != null)
+            {
+                RegisterType(new RegisteredTextType
+                {
+                    Name = "UI.Text",
+                    Category = "Unity",
+                    ComponentType = TypeHelper.UI_TextType,
+                    TextProp = TypeHelper.UI_TextProp,
+                    FontProp = TypeHelper.UI_FontProp,
+                    FontSizeProp = TypeHelper.UI_FontSizeProp,
+                    ColorProp = TypeHelper.UI_TextType.GetProperty("color", pubInst),
+                    FontTypeName = "Unity",
+                    NeedsForceMeshUpdate = false,
+                    NeedsSetAllDirty = true
+                });
+            }
+
+            // TextMesh (legacy 3D text)
+            if (TypeHelper.TextMeshType != null)
+            {
+                RegisterType(new RegisteredTextType
+                {
+                    Name = "TextMesh",
+                    Category = "TextMesh",
+                    ComponentType = TypeHelper.TextMeshType,
+                    TextProp = TypeHelper.TextMesh_TextProp,
+                    FontProp = TypeHelper.TextMesh_FontProp,
+                    FontSizeProp = null, // TextMesh uses characterSize, not fontSize
+                    ColorProp = TypeHelper.TextMeshType.GetProperty("color", pubInst),
+                    FontTypeName = "TextMesh",
+                    NeedsForceMeshUpdate = false,
+                    NeedsSetAllDirty = false
+                });
+            }
+
+            // Alternate TMP types (TMProOld, etc.) - only if not already covered
+            RegisterAlternateTMPTypes();
+
+            // Register generic types already detected by TranslatorPatches
+            foreach (var genericType in TranslatorPatches.GenericTextTypes)
+            {
+                RegisterType(genericType);
+            }
+
+            TranslatorCore.LogInfo($"[Scanner] Registered {_registeredTypes.Count} text component types");
+        }
+
+        /// <summary>
+        /// Register alternate TMP implementations from different namespaces (TMProOld, etc.)
+        /// </summary>
+        private static void RegisterAlternateTMPTypes()
+        {
+            if (TypeHelper.UseAlternateTMP) return; // Already handled by TMP_TextType
+
+            string[] altNamespaces = { "TMProOld", "TextMeshPro", "TMPro.Old" };
+            string[] tmpTypeNames = { "TMP_Text", "TextMeshPro", "TextMeshProUGUI" };
+            var pubInst = BindingFlags.Public | BindingFlags.Instance;
+
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    string asmName = asm.GetName().Name;
+                    if (asmName.StartsWith("System") || asmName.StartsWith("mscorlib")) continue;
+
+                    foreach (var type in asm.GetTypes())
+                    {
+                        try
+                        {
+                            string typeName = type.Name;
+                            string typeNamespace = type.Namespace ?? "";
+
+                            // Skip standard TMPro types (already registered above)
+                            if (TypeHelper.TMP_TextType != null && (type == TypeHelper.TMP_TextType || type.IsSubclassOf(TypeHelper.TMP_TextType)))
+                                continue;
+
+                            // Check if it's a TMP-like type name
+                            bool isTmpType = false;
+                            foreach (var name in tmpTypeNames)
+                            {
+                                if (typeName == name || typeName.EndsWith(name)) { isTmpType = true; break; }
+                            }
+                            if (!isTmpType) continue;
+
+                            // Must be in an alternate namespace
+                            if (typeNamespace == "TMPro") continue;
+                            bool isAlt = false;
+                            foreach (var ns in altNamespaces)
+                            {
+                                if (typeNamespace.Contains(ns)) { isAlt = true; break; }
+                            }
+                            if (!isAlt && typeNamespace == "TMPro") continue;
+
+                            // Must have text property and be a Component
+                            var textProp = type.GetProperty("text", pubInst);
+                            if (textProp?.SetMethod == null) continue;
+                            if (!typeof(Component).IsAssignableFrom(type)) continue;
+
+                            // Already registered?
+                            bool alreadyRegistered = false;
+                            foreach (var existing in _registeredTypes)
+                            {
+                                if (existing.ComponentType == type) { alreadyRegistered = true; break; }
+                            }
+                            if (alreadyRegistered) continue;
+
+                            RegisterType(new RegisteredTextType
+                            {
+                                Name = $"{typeNamespace}.{typeName}",
+                                Category = "TMP",
+                                ComponentType = type,
+                                TextProp = textProp,
+                                FontProp = type.GetProperty("font", pubInst),
+                                FontSizeProp = type.GetProperty("fontSize", pubInst),
+                                ColorProp = type.GetProperty("color", pubInst),
+                                FontTypeName = "TMP (alt)",
+                                NeedsForceMeshUpdate = true,
+                                NeedsSetAllDirty = false
+                            });
+                            TranslatorCore.LogInfo($"[Scanner] Registered alternate TMP type: {type.FullName}");
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// Find a type by full name across all loaded assemblies.
+        /// Handles IL2CPP prefixed names (e.g., Il2CppTMPro.TextMeshProUGUI).
+        /// </summary>
+        private static Type FindType(string fullName)
+        {
+            // Extract class name for IL2CPP prefix search
+            string className = fullName.Contains(".") ? fullName.Substring(fullName.LastIndexOf('.') + 1) : fullName;
+
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    // Try exact name first
+                    var type = asm.GetType(fullName);
+                    if (type != null) return type;
+
+                    // On IL2CPP, types may have Il2Cpp prefix on namespace
+                    // e.g., TMPro.TextMeshProUGUI -> Il2CppTMPro.TextMeshProUGUI
+                    if (fullName.Contains("."))
+                    {
+                        string il2cppName = "Il2Cpp" + fullName;
+                        type = asm.GetType(il2cppName);
+                        if (type != null) return type;
+                    }
+                }
+                catch { }
+            }
+
+            // Last resort: scan all types by class name (handles any namespace prefix)
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    foreach (var type in asm.GetTypes())
+                    {
+                        if (type.Name == className && !type.IsAbstract)
+                            return type;
+                    }
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        #endregion
+
+        #region Cache Refresh
+
+        /// <summary>
+        /// Refresh the component cache for a registered type.
+        /// Tries multiple strategies and merges results by instance ID to avoid duplicates.
+        /// </summary>
+        private static UnityEngine.Object[] RefreshTypeCache(RegisteredTextType type)
+        {
+            var seenIds = new HashSet<int>();
+            var results = new List<UnityEngine.Object>();
+
+            // Strategy 1: IL2CPP native scan
+            TryAddFromIL2CPPNative(type, results, seenIds);
+
+            // Strategy 2: TypeHelper (works for both Mono and IL2CPP)
+            TryAddFromTypeHelper(type, results, seenIds);
+
+            // Strategy 3: Static list fields (for NGUI etc.)
+            TryAddFromStaticLists(type, results, seenIds);
+
+            // Strategy 4: MonoBehaviour filter fallback
+            // Used when all other strategies fail (common on IL2CPP for TMP and third-party types)
+            if (results.Count == 0)
+            {
+                TryAddFromMonoBehaviourFilter(type, results, seenIds);
+            }
+
+            return results.Count > 0 ? results.ToArray() : null;
+        }
+
+        private static void TryAddFromIL2CPPNative(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
+        {
+            if (!il2cppScanAvailable || type.IL2CPPType == null) return;
+
+            try
+            {
+                var found = FindAllComponentsIL2CPPCached(type.IL2CPPType);
+                if (found == null) return;
+                foreach (var obj in found)
+                {
+                    if (obj == null) continue;
+                    int id = obj.GetInstanceID();
+                    if (seenIds.Add(id))
+                        results.Add(obj);
+                }
+            }
+            catch { }
+        }
+
+        private static void TryAddFromTypeHelper(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
+        {
+            try
+            {
+                var found = TypeHelper.FindAllObjectsOfType(type.ComponentType);
+                if (found == null) return;
+                foreach (var obj in found)
+                {
+                    if (obj == null) continue;
+                    int id = obj.GetInstanceID();
+                    if (seenIds.Add(id))
+                        results.Add(obj);
+                }
+            }
+            catch { }
+        }
+
+        private static void TryAddFromStaticLists(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
+        {
+            try
+            {
+                var componentType = type.ComponentType;
+                var staticFields = componentType.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+                string[] listFieldNames = { "mList", "sList", "s_Instances", "instances", "allInstances", "s_list" };
+
+                foreach (var field in staticFields)
+                {
+                    var fieldType = field.FieldType;
+                    if (fieldType == null) continue;
+
+                    bool nameMatch = false;
+                    foreach (var knownName in listFieldNames)
+                    {
+                        if (string.Equals(field.Name, knownName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            nameMatch = true;
+                            break;
+                        }
+                    }
+
+                    if (!nameMatch)
+                    {
+                        string ftName = fieldType.Name ?? "";
+                        if (!ftName.Contains("List") && !ftName.Contains("Array") &&
+                            !ftName.Contains("Collection") && !ftName.Contains("HashSet"))
+                            continue;
+                    }
+
+                    object listObj = null;
+                    try { listObj = field.GetValue(null); }
+                    catch { continue; }
+                    if (listObj == null) continue;
+
+                    var items = ExtractObjectsFromList(listObj, componentType);
+                    if (items == null) continue;
+
+                    foreach (var obj in items)
+                    {
+                        if (obj == null) continue;
+                        int id = obj.GetInstanceID();
+                        if (seenIds.Add(id))
+                            results.Add(obj);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void TryAddFromMonoBehaviourFilter(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
+        {
+            try
+            {
+                // On IL2CPP, IsInstanceOfType may fail for proxy types.
+                // Use type name matching as fallback: check if the runtime type name
+                // matches or inherits from the target type name.
+                string targetName = type.ComponentType.Name;
+                // Strip Il2Cpp prefix for matching
+                if (targetName.StartsWith("Il2Cpp")) targetName = targetName.Substring(6);
+
+                var allComponents = TypeHelper.FindAllObjectsOfType(typeof(Component));
+                if (allComponents == null) return;
+
+                foreach (var obj in allComponents)
+                {
+                    if (obj == null) continue;
+
+                    // Try IsInstanceOfType first (works on Mono)
+                    if (type.ComponentType.IsInstanceOfType(obj))
+                    {
+                        int id = obj.GetInstanceID();
+                        if (seenIds.Add(id))
+                            results.Add(obj);
+                        continue;
+                    }
+
+                    // Fallback: match by type name (handles IL2CPP proxy types)
+                    var objType = obj.GetType();
+                    var current = objType;
+                    while (current != null)
+                    {
+                        string name = current.Name;
+                        if (name.StartsWith("Il2Cpp")) name = name.Substring(6);
+                        if (name == targetName)
+                        {
+                            int id = obj.GetInstanceID();
+                            if (seenIds.Add(id))
+                                results.Add(obj);
+                            break;
+                        }
+                        current = current.BaseType;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Extract UnityEngine.Object instances from a list/collection object.
+        /// Handles BetterList (NGUI), List, arrays, etc.
+        /// </summary>
+        private static UnityEngine.Object[] ExtractObjectsFromList(object listObj, Type expectedType)
+        {
+            try
+            {
+                var results = new List<UnityEngine.Object>();
+
+                // Try 'buffer' field + 'size' field (BetterList pattern from NGUI)
+                var bufferField = listObj.GetType().GetField("buffer", BindingFlags.Public | BindingFlags.Instance);
+                var sizeField = listObj.GetType().GetField("size", BindingFlags.Public | BindingFlags.Instance);
+                if (bufferField != null && sizeField != null)
+                {
+                    var buffer = bufferField.GetValue(listObj);
+                    var size = sizeField.GetValue(listObj);
+                    if (buffer is System.Collections.IEnumerable enumerable && size is int count)
+                    {
+                        int idx = 0;
+                        foreach (var item in enumerable)
+                        {
+                            if (idx >= count) break;
+                            if (item is UnityEngine.Object uobj)
+                                results.Add(uobj);
+                            idx++;
+                        }
+                        if (results.Count > 0) return results.ToArray();
+                    }
+                }
+
+                // Try IEnumerable directly (List<T>, etc.)
+                if (listObj is System.Collections.IEnumerable directEnum)
+                {
+                    foreach (var item in directEnum)
+                    {
+                        if (item is UnityEngine.Object uobj)
+                            results.Add(uobj);
+                    }
+                    if (results.Count > 0) return results.ToArray();
+                }
+
+                // Try Count + Item indexer pattern
+                var countProp = listObj.GetType().GetProperty("Count");
+                var itemProp = listObj.GetType().GetProperty("Item");
+                if (countProp != null && itemProp != null)
+                {
+                    int count2 = (int)countProp.GetValue(listObj, null);
+                    for (int i = 0; i < count2; i++)
+                    {
+                        var item = itemProp.GetValue(listObj, new object[] { i });
+                        if (item is UnityEngine.Object uobj)
+                            results.Add(uobj);
+                    }
+                    if (results.Count > 0) return results.ToArray();
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        #endregion
+
+        #region Component Processing
+
+        /// <summary>
+        /// Get text from a component using the appropriate method for its type.
+        /// Built-in types use TypeHelper (handles IL2CPP casting); generic types use direct property access.
+        /// </summary>
+        private static string GetTextForType(object component, RegisteredTextType type)
+        {
+            if (type.Category == "TMP" || type.Category == "Unity" || type.Category == "TextMesh")
+                return TypeHelper.GetText(component);
+            // Generic types use direct property access
+            return type.TextProp?.GetValue(component, null) as string;
+        }
+
+        /// <summary>
+        /// Set text on a component using the appropriate method for its type.
+        /// </summary>
+        private static void SetTextForType(object component, RegisteredTextType type, string text)
+        {
+            if (type.Category == "TMP" || type.Category == "Unity" || type.Category == "TextMesh")
+                TypeHelper.SetText(component, text);
+            else
+                type.TextProp?.SetValue(component, text, null);
+        }
+
+        /// <summary>
+        /// Get font name from a component, using TypeHelper for built-in types.
+        /// </summary>
+        private static string GetFontNameForType(object component, RegisteredTextType type)
+        {
+            if (type.Category == "TMP" || type.Category == "Unity" || type.Category == "TextMesh")
+                return TypeHelper.GetFontName(component);
+
+            // Generic types: use font property directly
+            if (type.FontProp == null) return null;
+            try
+            {
+                var fontObj = type.FontProp.GetValue(component, null);
+                if (fontObj is UnityEngine.Object uobj && !string.IsNullOrEmpty(uobj.name))
+                    return uobj.name;
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// Process a single component for a registered text type.
+        /// </summary>
+        private static void ProcessComponentForType(object component, RegisteredTextType type)
+        {
+            try
+            {
+                var comp = component as Component;
+                if (comp == null) return;
+
+                int instanceId = comp.GetInstanceID();
+
+                // Skip if own UI and should not be translated
+                if (TranslatorCore.ShouldSkipTranslation(comp))
+                    return;
+
+                // Skip if translation disabled for this font
+                string fontName = GetFontNameForType(component, type);
+                if (!string.IsNullOrEmpty(fontName) && !FontManager.IsTranslationEnabled(fontName))
+                    return;
+
+                // Skip if already identified as InputField user text
+                if (inputFieldTextIds.Contains(instanceId))
+                    return;
+
+                // First-time check: is this the textComponent of an InputField?
+                if (type.Category != "TextMesh" && TypeHelper.IsInputFieldTextComponent(component))
+                {
+                    inputFieldTextIds.Add(instanceId);
+                    TranslatorCore.LogInfo($"[Scanner] Excluded InputField textComponent: {comp.gameObject.name}");
+                    return;
+                }
+
+                string currentText = GetTextForType(component, type);
+
+                if (string.IsNullOrEmpty(currentText) || currentText.Length < 2) return;
+
+                int textHash = currentText.GetHashCode();
+
+                // Quick skip: already processed with same text
+                if (processedTextHashes.TryGetValue(instanceId, out int lastHash) && lastHash == textHash)
+                    return;
+
+                // Check if text changed since last seen
+                if (TranslatorCore.HasSeenText(instanceId, currentText, out _))
+                {
+                    processedTextHashes[instanceId] = textHash;
+                    return;
+                }
+
+                // Check if own UI (use UI-specific prompt)
+                bool isOwnUI = TranslatorCore.IsOwnUITranslatable(comp);
+                string translated = TranslatorCore.TranslateTextWithTracking(currentText, comp, isOwnUI);
+                if (translated != currentText)
+                {
+                    SetTextForType(component, type, translated);
+
+                    // Force refresh based on type flags
+                    if (type.NeedsForceMeshUpdate)
+                        TypeHelper.ForceMeshUpdate(component);
+                    else if (type.NeedsSetAllDirty)
+                        TypeHelper.SetAllDirty(component);
+
+                    TranslatorCore.UpdateSeenText(instanceId, translated);
+                    processedTextHashes[instanceId] = translated.GetHashCode();
+                }
+                else
+                {
+                    TranslatorCore.UpdateSeenText(instanceId, currentText);
+                    processedTextHashes[instanceId] = textHash;
+                }
+            }
+            catch { }
+        }
+
+        #endregion
+
+        #region ForceRefreshAllText
 
         /// <summary>
         /// Force refresh all text components by re-assigning their text.
         /// If translations are disabled, restores original texts from cache.
         /// This triggers Harmony patches to re-process and apply translations/fonts.
-        /// Call after changing settings that affect text display (fonts, translations).
         /// </summary>
         public static void ForceRefreshAllText()
         {
             int refreshed = 0;
             int restored = 0;
 
-            // Check if we should restore originals (global translations disabled)
             bool globalRestore = !TranslatorCore.Config.enable_translations;
 
             try
             {
-                // Refresh cached Mono UI.Text components
-                if (cachedUIMono != null)
+                foreach (var type in _registeredTypes)
                 {
-                    foreach (var obj in cachedUIMono)
+                    if (type.CachedComponents == null) continue;
+                    foreach (var obj in type.CachedComponents)
                     {
                         if (obj == null) continue;
-                        try
-                        {
-                            int instanceId = obj.GetInstanceID();
-
-                            // Restore if global translations disabled OR per-font disabled
-                            // Check both current font name AND original font name (in case font was replaced)
-                            string compFontName = TypeHelper.GetFontName(obj);
-                            string origFontName = FontManager.GetOriginalFontName(instanceId);
-                            bool fontDisabled = (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName))
-                                || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
-                            bool shouldRestore = globalRestore || fontDisabled;
-                            if (shouldRestore)
-                            {
-                                // Try to restore original text and font
-                                string original = GetOriginalText(instanceId);
-                                if (original != null)
-                                {
-                                    FontManager.RestoreOriginalFont(obj);
-                                    TypeHelper.SetText(obj, original);
-                                    ClearOriginalText(instanceId);
-                                    processedTextHashes.Remove(instanceId);
-                                    restored++;
-                                    continue;
-                                }
-                            }
-
-                            // Normal refresh path (trigger Harmony patch)
-                            string currentText = TypeHelper.GetText(obj);
-                            if (!string.IsNullOrEmpty(currentText))
-                            {
-                                TypeHelper.SetText(obj, currentText);
-                                refreshed++;
-                            }
-                        }
-                        catch { }
+                        RefreshComponent(obj, type, globalRestore, ref refreshed, ref restored);
                     }
                 }
-
-                // Refresh cached Mono TMP components
-                if (cachedTMPMono != null)
-                {
-                    foreach (var obj in cachedTMPMono)
-                    {
-                        if (obj == null) continue;
-                        try
-                        {
-                            int instanceId = obj.GetInstanceID();
-
-                            // Restore if global translations disabled OR per-font disabled
-                            // Check both current font name AND original font name (in case font was replaced)
-                            string compFontName = TypeHelper.GetFontName(obj);
-                            string origFontName = FontManager.GetOriginalFontName(instanceId);
-                            bool fontDisabled = (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName))
-                                || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
-                            bool shouldRestore = globalRestore || fontDisabled;
-                            if (shouldRestore)
-                            {
-                                // Restore original font before restoring text
-                                FontManager.RestoreOriginalFont(obj);
-
-                                string original = GetOriginalText(instanceId);
-                                if (original != null)
-                                {
-                                    TypeHelper.SetText(obj, original);
-                                    ClearOriginalText(instanceId);
-                                    processedTextHashes.Remove(instanceId);
-                                    restored++;
-                                    continue;
-                                }
-                            }
-
-                            string currentText = TypeHelper.GetText(obj);
-                            if (!string.IsNullOrEmpty(currentText))
-                            {
-                                // Set empty then back to force TMP to re-render
-                                // (setting same text doesn't trigger re-render when fallback changed)
-                                TypeHelper.SetText(obj, "");
-                                TypeHelper.SetText(obj, currentText);
-                                TypeHelper.ForceMeshUpdate(obj);
-                                refreshed++;
-                            }
-                        }
-                        catch { }
-                    }
-                }
-
-                // Refresh cached IL2CPP components (if available)
-                RefreshIL2CPPCachedComponents(cachedUIComponents, tryCastTextMethod, globalRestore, ref refreshed, ref restored);
-                RefreshIL2CPPCachedComponents(cachedTMPComponents, tryCastTMPMethod, globalRestore, ref refreshed, ref restored);
-
-                // Refresh alternate TMP components (TMProOld, etc.) - scan dynamically since they're not cached
-                refreshed += RefreshAlternateTMPComponents(globalRestore, ref restored);
-
-                // Refresh generic text types (NGUI UILabel, SuperTextMesh, etc.)
-                refreshed += RefreshGenericTextComponents(globalRestore, ref restored);
 
                 if (restored > 0)
                     TranslatorCore.LogInfo($"[Scanner] Restored {restored} original texts, refreshed {refreshed} components");
@@ -292,213 +952,72 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Refresh alternate TMP components (TMProOld, etc.) by scanning the scene.
-        /// These are not cached because they use reflection and different types per game.
+        /// Refresh a single component: either restore original or trigger re-translation.
         /// </summary>
-        private static int RefreshAlternateTMPComponents(bool shouldRestore, ref int restored)
+        private static void RefreshComponent(UnityEngine.Object obj, RegisteredTextType type, bool globalRestore, ref int refreshed, ref int restored)
         {
-            int refreshed = 0;
-
-            // When TypeHelper resolved TMP types to TMProOld, those components are already
-            // in cachedTMPMono and processed by the standard TMP loop. Skip to avoid double processing.
-            if (TypeHelper.UseAlternateTMP) return 0;
-
             try
             {
-                // Find TMProOld.TMP_Text type
-                Type tmpTextType = null;
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                // For IL2CPP native scan results, need TryCast to get the typed component
+                object component = obj;
+                if (type.TryCastMethod != null && TranslatorCore.Adapter?.IsIL2CPP == true)
                 {
-                    tmpTextType = asm.GetType("TMProOld.TMP_Text");
-                    if (tmpTextType != null) break;
-                }
-
-                if (tmpTextType == null) return 0;
-
-                // Get text property for reflection
-                var textProp = tmpTextType.GetProperty("text", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
-                if (textProp == null) return 0;
-
-                // Find all components in scene
-                var allComponents = FindAllObjectsOfType(tmpTextType);
-                TranslatorCore.LogInfo($"[Scanner] Found {allComponents.Length} alternate TMP components");
-
-                foreach (var component in allComponents)
-                {
-                    if (component == null) continue;
-
-                    try
+                    if (!type.ComponentType.IsInstanceOfType(obj))
                     {
-                        var unityComponent = component as Component;
-                        if (unityComponent == null) continue;
-
-                        // Skip our own UI
-                        if (TranslatorCore.ShouldSkipTranslation(unityComponent)) continue;
-
-                        int instanceId = unityComponent.GetInstanceID();
-
-                        if (shouldRestore)
-                        {
-                            string original = GetOriginalText(instanceId);
-                            if (original != null)
-                            {
-                                textProp.SetValue(component, original, null);
-                                ClearOriginalText(instanceId);
-                                processedTextHashes.Remove(instanceId);
-                                restored++;
-                                continue;
-                            }
-                        }
-
-                        // Refresh by re-setting text (triggers Harmony patch)
-                        string currentText = textProp.GetValue(component, null) as string;
-                        if (!string.IsNullOrEmpty(currentText))
-                        {
-                            textProp.SetValue(component, currentText, null);
-                            refreshed++;
-                        }
-                    }
-                    catch { }
-                }
-            }
-            catch (Exception ex)
-            {
-                TranslatorCore.LogWarning($"[Scanner] RefreshAlternateTMP error: {ex.Message}");
-            }
-
-            return refreshed;
-        }
-
-        /// <summary>
-        /// Refresh generically detected text components (NGUI UILabel, etc.)
-        /// </summary>
-        private static int RefreshGenericTextComponents(bool globalRestore, ref int restored)
-        {
-            int refreshed = 0;
-            foreach (var typeInfo in TranslatorPatches.GenericTextTypes)
-            {
-                try
-                {
-                    var allComponents = TypeHelper.FindAllObjectsOfType(typeInfo.ComponentType);
-                    if (allComponents == null) continue;
-
-                    foreach (var component in allComponents)
-                    {
-                        if (component == null) continue;
-                        try
-                        {
-                            var unityComponent = component as Component;
-                            if (unityComponent == null) continue;
-                            if (TranslatorCore.ShouldSkipTranslation(unityComponent)) continue;
-
-                            int instanceId = unityComponent.GetInstanceID();
-
-                            // Check per-font disable
-                            bool shouldRestore = globalRestore;
-                            if (!shouldRestore && typeInfo.FontProp != null)
-                            {
-                                try
-                                {
-                                    var fontObj = typeInfo.FontProp.GetValue(component, null);
-                                    if (fontObj is UnityEngine.Object uobj && !string.IsNullOrEmpty(uobj.name))
-                                    {
-                                        string origFont = FontManager.GetOriginalFontName(instanceId);
-                                        string checkFont = origFont ?? uobj.name;
-                                        if (!FontManager.IsTranslationEnabled(checkFont))
-                                            shouldRestore = true;
-                                    }
-                                }
-                                catch { }
-                            }
-
-                            if (shouldRestore)
-                            {
-                                string original = GetOriginalText(instanceId);
-                                if (original != null)
-                                {
-                                    typeInfo.TextProp.SetValue(component, original, null);
-                                    ClearOriginalText(instanceId);
-                                    processedTextHashes.Remove(instanceId);
-                                    restored++;
-                                    continue;
-                                }
-                            }
-
-                            // Refresh by re-setting text (triggers Harmony patch)
-                            string currentText = typeInfo.TextProp.GetValue(component, null) as string;
-                            if (!string.IsNullOrEmpty(currentText))
-                            {
-                                typeInfo.TextProp.SetValue(component, currentText, null);
-                                refreshed++;
-                            }
-                        }
-                        catch { }
+                        component = TryCastToType(obj, type.TryCastMethod);
+                        if (component == null) return;
                     }
                 }
-                catch (Exception ex)
+
+                int instanceId = TypeHelper.GetInstanceID(component);
+                if (instanceId == -1) return;
+
+                // Check per-font translation state
+                string compFontName = GetFontNameForType(component, type);
+                string origFontName = FontManager.GetOriginalFontName(instanceId);
+                bool fontDisabled = (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName))
+                    || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
+                bool shouldRestore = globalRestore || fontDisabled;
+
+                if (shouldRestore)
                 {
-                    TranslatorCore.LogWarning($"[Scanner] RefreshGenericText error ({typeInfo.FrameworkName}): {ex.Message}");
-                }
-            }
-            return refreshed;
-        }
-
-        /// <summary>
-        /// Helper to refresh IL2CPP cached components (shared logic for TMP and UI).
-        /// </summary>
-        private static void RefreshIL2CPPCachedComponents(UnityEngine.Object[] cache, MethodInfo tryCastMethod,
-            bool globalRestore, ref int refreshed, ref int restored)
-        {
-            if (cache == null || tryCastMethod == null) return;
-
-            foreach (var obj in cache)
-            {
-                if (obj == null) continue;
-                try
-                {
-                    object component;
-                    if (tryCastMethod.DeclaringType != null && !tryCastMethod.IsStatic)
-                        component = tryCastMethod.Invoke(obj, null);
-                    else
-                        component = tryCastMethod.Invoke(null, new object[] { obj });
-                    if (component == null) continue;
-
-                    int instanceId = TypeHelper.GetInstanceID(component);
-                    if (instanceId == -1) continue;
-
-                    // Check per-font translation state (check both current and original font name)
-                    string compFontName = TypeHelper.GetFontName(component);
-                    string origFontName = FontManager.GetOriginalFontName(instanceId);
-                    bool fontDisabled = (!string.IsNullOrEmpty(origFontName) && !FontManager.IsTranslationEnabled(origFontName))
-                        || (!string.IsNullOrEmpty(compFontName) && !FontManager.IsTranslationEnabled(compFontName));
-                    bool shouldRestore = globalRestore || fontDisabled;
-                    if (shouldRestore)
-                    {
+                    // Restore original font (for built-in types)
+                    if (type.Category == "TMP" || type.Category == "Unity" || type.Category == "TextMesh")
                         FontManager.RestoreOriginalFont(component);
 
-                        string original = GetOriginalText(instanceId);
-                        if (original != null)
-                        {
-                            TypeHelper.SetText(component, original);
-                            ClearOriginalText(instanceId);
-                            processedTextHashes.Remove(instanceId);
-                            restored++;
-                            continue;
-                        }
-                    }
-
-                    string currentText = TypeHelper.GetText(component);
-                    if (!string.IsNullOrEmpty(currentText))
+                    string original = GetOriginalText(instanceId);
+                    if (original != null)
                     {
-                        TypeHelper.SetText(component, "");
-                        TypeHelper.SetText(component, currentText);
-                        TypeHelper.ForceMeshUpdate(component);
-                        refreshed++;
+                        SetTextForType(component, type, original);
+                        ClearOriginalText(instanceId);
+                        processedTextHashes.Remove(instanceId);
+                        restored++;
+                        return;
                     }
                 }
-                catch { }
+
+                // Normal refresh path (trigger Harmony patch)
+                string currentText = GetTextForType(component, type);
+                if (!string.IsNullOrEmpty(currentText))
+                {
+                    if (type.NeedsForceMeshUpdate)
+                    {
+                        // TMP needs empty-then-restore to force re-render
+                        SetTextForType(component, type, "");
+                        SetTextForType(component, type, currentText);
+                        TypeHelper.ForceMeshUpdate(component);
+                    }
+                    else
+                    {
+                        SetTextForType(component, type, currentText);
+                    }
+                    refreshed++;
+                }
             }
+            catch { }
         }
+
+        #endregion
 
         #region Original Text Tracking
 
@@ -563,6 +1082,10 @@ namespace UnityGameTranslator.Core
             return TypeHelper.GetInstanceID(component);
         }
 
+        #endregion
+
+        #region Font Operations (Restore/Refresh/Highlight)
+
         /// <summary>
         /// Restore originals for components using a specific font.
         /// Call when per-font translation is disabled.
@@ -574,7 +1097,6 @@ namespace UnityGameTranslator.Core
 
             try
             {
-                // Match original + new fallback + old fallback
                 var fontNamesToMatch = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { fontName };
                 string newFallback = FontManager.GetConfiguredFallback(fontName);
                 if (!string.IsNullOrEmpty(newFallback))
@@ -582,13 +1104,15 @@ namespace UnityGameTranslator.Core
                 if (!string.IsNullOrEmpty(oldFallback))
                     fontNamesToMatch.Add(oldFallback);
 
-                // Restore Mono components with this font (TMP + UI.Text)
-                restored += RestoreOriginalsForFontInCache(cachedTMPMono, fontNamesToMatch);
-                restored += RestoreOriginalsForFontInCache(cachedUIMono, fontNamesToMatch);
-
-                // IL2CPP components
-                restored += RestoreOriginalsForFontIL2CPP(cachedTMPComponents, tryCastTMPMethod, fontNamesToMatch);
-                restored += RestoreOriginalsForFontIL2CPP(cachedUIComponents, tryCastTextMethod, fontNamesToMatch);
+                foreach (var type in _registeredTypes)
+                {
+                    if (type.CachedComponents == null) continue;
+                    foreach (var obj in type.CachedComponents)
+                    {
+                        if (obj == null) continue;
+                        restored += RestoreComponentForFont(obj, type, fontNamesToMatch);
+                    }
+                }
 
                 if (restored > 0)
                     TranslatorCore.LogInfo($"[Scanner] Restored {restored} originals for font: {fontName}");
@@ -597,6 +1121,40 @@ namespace UnityGameTranslator.Core
             {
                 TranslatorCore.LogWarning($"[Scanner] RestoreOriginalsForFont error: {ex.Message}");
             }
+        }
+
+        private static int RestoreComponentForFont(UnityEngine.Object obj, RegisteredTextType type, HashSet<string> fontNames)
+        {
+            try
+            {
+                object component = ResolveComponent(obj, type);
+                if (component == null) return 0;
+
+                int id = TypeHelper.GetInstanceID(component);
+                if (id == -1) return 0;
+
+                // Match against both current font name AND tracked original font name
+                string compFont = GetFontNameForType(component, type);
+                string origFont = FontManager.GetOriginalFontName(id);
+                bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
+                    || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
+                if (!matches) return 0;
+
+                // Restore font before text
+                if (type.Category == "TMP" || type.Category == "Unity" || type.Category == "TextMesh")
+                    FontManager.RestoreOriginalFont(component);
+
+                string original = GetOriginalText(id);
+                if (original != null)
+                {
+                    SetTextForType(component, type, original);
+                    ClearOriginalText(id);
+                    processedTextHashes.Remove(id);
+                    return 1;
+                }
+            }
+            catch { }
+            return 0;
         }
 
         /// <summary>
@@ -610,10 +1168,8 @@ namespace UnityGameTranslator.Core
 
             try
             {
-                // Force cache refresh to capture all current components
                 ForceRefreshCache();
 
-                // Build set of font names to match: original + new fallback + OLD fallback
                 var fontNamesToMatch = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { fontName };
                 string newFallback = FontManager.GetConfiguredFallback(fontName);
                 if (!string.IsNullOrEmpty(newFallback))
@@ -621,15 +1177,17 @@ namespace UnityGameTranslator.Core
                 if (!string.IsNullOrEmpty(oldFallback))
                     fontNamesToMatch.Add(oldFallback);
 
-                TranslatorCore.LogInfo($"[Scanner] RefreshForFont: matching fonts [{string.Join(", ", fontNamesToMatch)}], caches: TMP={cachedTMPMono?.Length ?? 0}, UI={cachedUIMono?.Length ?? 0}");
+                TranslatorCore.LogInfo($"[Scanner] RefreshForFont: matching fonts [{string.Join(", ", fontNamesToMatch)}]");
 
-                // Refresh Mono components (TMP + UI.Text)
-                refreshed += RefreshForFontInCache(cachedTMPMono, fontNamesToMatch);
-                refreshed += RefreshForFontInCache(cachedUIMono, fontNamesToMatch);
-
-                // IL2CPP components
-                refreshed += RefreshForFontIL2CPP(cachedTMPComponents, tryCastTMPMethod, fontNamesToMatch);
-                refreshed += RefreshForFontIL2CPP(cachedUIComponents, tryCastTextMethod, fontNamesToMatch);
+                foreach (var type in _registeredTypes)
+                {
+                    if (type.CachedComponents == null) continue;
+                    foreach (var obj in type.CachedComponents)
+                    {
+                        if (obj == null) continue;
+                        refreshed += RefreshComponentForFont(obj, type, fontNamesToMatch);
+                    }
+                }
 
                 TranslatorCore.LogInfo($"[Scanner] Refreshed {refreshed} components for font: {fontName}");
             }
@@ -639,172 +1197,50 @@ namespace UnityGameTranslator.Core
             }
         }
 
-        /// <summary>
-        /// Restore originals for a given font in a Mono component cache.
-        /// </summary>
-        private static int RestoreOriginalsForFontInCache(UnityEngine.Object[] cache, HashSet<string> fontNames)
+        private static int RefreshComponentForFont(UnityEngine.Object obj, RegisteredTextType type, HashSet<string> fontNames)
         {
-            if (cache == null) return 0;
-            int restored = 0;
-
-            foreach (var obj in cache)
+            try
             {
-                if (obj == null) continue;
-                try
+                object component = ResolveComponent(obj, type);
+                if (component == null) return 0;
+
+                int id = TypeHelper.GetInstanceID(component);
+                if (id == -1) return 0;
+
+                string compFont = GetFontNameForType(component, type);
+                string origFont = FontManager.GetOriginalFontName(id);
+                bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
+                    || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
+                if (!matches) return 0;
+
+                processedTextHashes.Remove(id);
+
+                string currentText = GetTextForType(component, type);
+                if (!string.IsNullOrEmpty(currentText))
                 {
-                    int id = obj.GetInstanceID();
-
-                    // Match against both current font name AND tracked original font name
-                    // (once replaced, component has replacement font name, not original)
-                    string compFont = TypeHelper.GetFontName(obj);
-                    string origFont = FontManager.GetOriginalFontName(id);
-                    bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
-                        || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
-                    if (!matches) continue;
-
-                    // Restore font before text (material + ForceMeshUpdate included)
-                    FontManager.RestoreOriginalFont(obj);
-
-                    string original = GetOriginalText(id);
-                    if (original != null)
-                    {
-                        TypeHelper.SetText(obj, original);
-                        ClearOriginalText(id);
-                        processedTextHashes.Remove(id);
-                        restored++;
-                    }
-                }
-                catch { }
-            }
-            return restored;
-        }
-
-        /// <summary>
-        /// Restore originals for a given font in an IL2CPP component cache.
-        /// </summary>
-        private static int RestoreOriginalsForFontIL2CPP(UnityEngine.Object[] cache, MethodInfo tryCastMethod, HashSet<string> fontNames)
-        {
-            if (cache == null || tryCastMethod == null) return 0;
-            int restored = 0;
-
-            foreach (var obj in cache)
-            {
-                if (obj == null) continue;
-                try
-                {
-                    object component = tryCastMethod.IsStatic
-                        ? tryCastMethod.Invoke(null, new object[] { obj })
-                        : tryCastMethod.Invoke(obj, null);
-                    if (component == null) continue;
-
-                    int id = TypeHelper.GetInstanceID(component);
-                    if (id == -1) continue;
-
-                    // Match against both current font name AND tracked original font name
-                    string compFont = TypeHelper.GetFontName(component);
-                    string origFont = FontManager.GetOriginalFontName(id);
-                    bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
-                        || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
-                    if (!matches) continue;
-
-                    // Restore font before text
-                    FontManager.RestoreOriginalFont(component);
-
-                    string original = GetOriginalText(id);
-                    if (original != null)
-                    {
-                        TypeHelper.SetText(component, original);
-                        ClearOriginalText(id);
-                        processedTextHashes.Remove(id);
-                        restored++;
-                    }
-                }
-                catch { }
-            }
-            return restored;
-        }
-
-        /// <summary>
-        /// Refresh components for matching fonts in a Mono cache.
-        /// </summary>
-        private static int RefreshForFontInCache(UnityEngine.Object[] cache, HashSet<string> fontNames)
-        {
-            if (cache == null) return 0;
-            int refreshed = 0;
-
-            foreach (var obj in cache)
-            {
-                if (obj == null) continue;
-                try
-                {
-                    int id = obj.GetInstanceID();
-
-                    // Match against both current font name AND tracked original font name
-                    string compFont = TypeHelper.GetFontName(obj);
-                    string origFont = FontManager.GetOriginalFontName(id);
-                    bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
-                        || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
-                    if (!matches) continue;
-
-                    processedTextHashes.Remove(id);
-
-                    string currentText = TypeHelper.GetText(obj);
-                    if (!string.IsNullOrEmpty(currentText))
-                    {
-                        // Set empty then back to force re-render with potentially new font
-                        TypeHelper.SetText(obj, "");
-                        TypeHelper.SetText(obj, currentText);
-                        TypeHelper.ForceMeshUpdate(obj);
-                        refreshed++;
-                    }
-                }
-                catch { }
-            }
-            return refreshed;
-        }
-
-        /// <summary>
-        /// Refresh components for matching fonts in an IL2CPP cache.
-        /// </summary>
-        private static int RefreshForFontIL2CPP(UnityEngine.Object[] cache, MethodInfo tryCastMethod, HashSet<string> fontNames)
-        {
-            if (cache == null || tryCastMethod == null) return 0;
-            int refreshed = 0;
-
-            foreach (var obj in cache)
-            {
-                if (obj == null) continue;
-                try
-                {
-                    object component = tryCastMethod.IsStatic
-                        ? tryCastMethod.Invoke(null, new object[] { obj })
-                        : tryCastMethod.Invoke(obj, null);
-                    if (component == null) continue;
-
-                    int id = TypeHelper.GetInstanceID(component);
-                    if (id == -1) continue;
-
-                    // Match against both current font name AND tracked original font name
-                    string compFont = TypeHelper.GetFontName(component);
-                    string origFont = FontManager.GetOriginalFontName(id);
-                    bool matches = (!string.IsNullOrEmpty(compFont) && fontNames.Contains(compFont))
-                        || (!string.IsNullOrEmpty(origFont) && fontNames.Contains(origFont));
-                    if (!matches) continue;
-
-                    processedTextHashes.Remove(id);
-
-                    string currentText = TypeHelper.GetText(component);
-                    if (!string.IsNullOrEmpty(currentText))
-                    {
-                        TypeHelper.SetText(component, "");
-                        TypeHelper.SetText(component, currentText);
+                    // Set empty then back to force re-render with potentially new font
+                    SetTextForType(component, type, "");
+                    SetTextForType(component, type, currentText);
+                    if (type.NeedsForceMeshUpdate)
                         TypeHelper.ForceMeshUpdate(component);
-                        refreshed++;
-                    }
+                    return 1;
                 }
-                catch { }
             }
-            return refreshed;
+            catch { }
+            return 0;
+        }
+
+        /// <summary>
+        /// Resolve a Unity Object to its typed component (handles IL2CPP TryCast).
+        /// </summary>
+        private static object ResolveComponent(UnityEngine.Object obj, RegisteredTextType type)
+        {
+            if (type.TryCastMethod != null && TranslatorCore.Adapter?.IsIL2CPP == true)
+            {
+                if (!type.ComponentType.IsInstanceOfType(obj))
+                    return TryCastToType(obj, type.TryCastMethod);
+            }
+            return obj;
         }
 
         #endregion
@@ -825,7 +1261,6 @@ namespace UnityGameTranslator.Core
         /// </summary>
         public static void HighlightFont(string fontName)
         {
-            // Clear any existing highlight first
             if (_highlightedFontName != null)
                 ClearHighlight();
 
@@ -835,16 +1270,23 @@ namespace UnityGameTranslator.Core
             {
                 ForceRefreshCache();
 
-                // Mono caches
-                HighlightCache(cachedTMPMono, fontName);
-                HighlightCache(cachedUIMono, fontName);
-
-                // IL2CPP caches (need casting to get font info)
-                HighlightIL2CPPCache(cachedTMPComponents, tryCastTMPMethod, fontName);
-                HighlightIL2CPPCache(cachedUIComponents, tryCastTextMethod, fontName);
-
-                // Generic text types (NGUI, SuperTextMesh, etc.)
-                HighlightGenericTextTypes(fontName);
+                foreach (var type in _registeredTypes)
+                {
+                    if (type.CachedComponents == null) continue;
+                    foreach (var obj in type.CachedComponents)
+                    {
+                        if (obj == null) continue;
+                        try
+                        {
+                            object component = ResolveComponent(obj, type);
+                            if (component == null) continue;
+                            int id = TypeHelper.GetInstanceID(component);
+                            if (id == -1) continue;
+                            HighlightComponent(component, id, fontName);
+                        }
+                        catch { }
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -861,115 +1303,28 @@ namespace UnityGameTranslator.Core
 
             try
             {
-                // Restore all caches
-                RestoreCache(cachedTMPMono);
-                RestoreCache(cachedUIMono);
-                RestoreIL2CPPCache(cachedTMPComponents, tryCastTMPMethod);
-                RestoreIL2CPPCache(cachedUIComponents, tryCastTextMethod);
-                RestoreGenericTextTypes();
+                foreach (var type in _registeredTypes)
+                {
+                    if (type.CachedComponents == null) continue;
+                    foreach (var obj in type.CachedComponents)
+                    {
+                        if (obj == null) continue;
+                        try
+                        {
+                            object component = ResolveComponent(obj, type);
+                            if (component == null) continue;
+                            int id = TypeHelper.GetInstanceID(component);
+                            if (id == -1) continue;
+                            RestoreComponentColor(component, id);
+                        }
+                        catch { }
+                    }
+                }
             }
             catch { }
 
             _highlightOriginalColors.Clear();
             _highlightedFontName = null;
-        }
-
-        private static void HighlightCache(UnityEngine.Object[] cache, string targetFontName)
-        {
-            if (cache == null) return;
-            foreach (var obj in cache)
-            {
-                if (obj == null) continue;
-                try { HighlightComponent(obj, obj.GetInstanceID(), targetFontName); } catch { }
-            }
-        }
-
-        private static void HighlightIL2CPPCache(UnityEngine.Object[] cache, MethodInfo tryCastMethod, string targetFontName)
-        {
-            if (cache == null || tryCastMethod == null) return;
-            foreach (var obj in cache)
-            {
-                if (obj == null) continue;
-                try
-                {
-                    object component = tryCastMethod.IsStatic
-                        ? tryCastMethod.Invoke(null, new object[] { obj })
-                        : tryCastMethod.Invoke(obj, null);
-                    if (component == null) continue;
-
-                    int id = TypeHelper.GetInstanceID(component);
-                    if (id == -1) continue;
-                    HighlightComponent(component, id, targetFontName);
-                }
-                catch { }
-            }
-        }
-
-        private static void RestoreCache(UnityEngine.Object[] cache)
-        {
-            if (cache == null) return;
-            foreach (var obj in cache)
-            {
-                if (obj == null) continue;
-                try { RestoreComponentColor(obj, obj.GetInstanceID()); } catch { }
-            }
-        }
-
-        private static void RestoreIL2CPPCache(UnityEngine.Object[] cache, MethodInfo tryCastMethod)
-        {
-            if (cache == null || tryCastMethod == null) return;
-            foreach (var obj in cache)
-            {
-                if (obj == null) continue;
-                try
-                {
-                    object component = tryCastMethod.IsStatic
-                        ? tryCastMethod.Invoke(null, new object[] { obj })
-                        : tryCastMethod.Invoke(obj, null);
-                    if (component == null) continue;
-
-                    int id = TypeHelper.GetInstanceID(component);
-                    if (id == -1) continue;
-                    RestoreComponentColor(component, id);
-                }
-                catch { }
-            }
-        }
-
-        private static void HighlightGenericTextTypes(string targetFontName)
-        {
-            foreach (var typeInfo in TranslatorPatches.GenericTextTypes)
-            {
-                try
-                {
-                    var allComponents = TypeHelper.FindAllObjectsOfType(typeInfo.ComponentType);
-                    if (allComponents == null) continue;
-                    foreach (var obj in allComponents)
-                    {
-                        if (obj == null) continue;
-                        try { HighlightComponent(obj, obj.GetInstanceID(), targetFontName); } catch { }
-                    }
-                }
-                catch { }
-            }
-        }
-
-        private static void RestoreGenericTextTypes()
-        {
-            foreach (var typeInfo in TranslatorPatches.GenericTextTypes)
-            {
-                try
-                {
-                    var allComponents = TypeHelper.FindAllObjectsOfType(typeInfo.ComponentType);
-                    if (allComponents == null) continue;
-                    foreach (var obj in allComponents)
-                    {
-                        if (obj == null) continue;
-                        try { RestoreComponentColor(obj, obj.GetInstanceID()); } catch { }
-                    }
-                }
-                catch { }
-            }
         }
 
         private static void HighlightComponent(object component, int id, string targetFontName)
@@ -1003,31 +1358,31 @@ namespace UnityGameTranslator.Core
 
         #endregion
 
+        #region Scanning Control
+
         /// <summary>
         /// Check if scanning should be skipped (no useful work to do).
-        /// Returns true if scanning can be skipped.
         /// </summary>
         private static bool ShouldSkipScanning()
         {
-            // If translations are disabled, no point scanning
             if (!TranslatorCore.Config.enable_translations)
                 return true;
 
-            // If we have cached translations to serve, keep scanning
             if (TranslatorCore.TranslationCache.Count > 0)
                 return false;
 
-            // If AI is enabled, we need to scan to queue new translations
             if (TranslatorCore.Config.enable_ai)
                 return false;
 
-            // If capture mode is enabled, we need to scan to capture keys
             if (TranslatorCore.Config.capture_keys_only)
                 return false;
 
-            // No cache, no AI, no capture mode - nothing useful to do
             return true;
         }
+
+        #endregion
+
+        #region IL2CPP Initialization
 
         /// <summary>
         /// Initialize IL2CPP methods via reflection. Call once at startup for IL2CPP games.
@@ -1113,37 +1468,10 @@ namespace UnityGameTranslator.Core
                     TypeHelper.SetIL2CPPMethods(il2cppTypeOfMethod, resourcesFindAllMethod,
                         tryCastMethod, tryCastMethod != null && tryCastMethod.IsStatic);
 
-                // Pre-cache generic methods for TMP_Text and Text
-                // Use TypeHelper resolved types instead of compile-time typeof()
-                // This avoids TypeLoadException on IL2CPP where standard assemblies aren't compatible
                 if (il2cppScanAvailable)
-                {
-                    try
-                    {
-                        if (TypeHelper.TMP_TextType != null)
-                            il2cppTypeTMP = il2cppTypeOfMethod.MakeGenericMethod(TypeHelper.TMP_TextType).Invoke(null, null);
-                        if (TypeHelper.UI_TextType != null)
-                            il2cppTypeText = il2cppTypeOfMethod.MakeGenericMethod(TypeHelper.UI_TextType).Invoke(null, null);
-                    }
-                    catch (Exception ex)
-                    {
-                        TranslatorCore.LogWarning($"IL2CPP type resolution failed: {ex.Message}");
-                    }
-
-                    if (tryCastMethod != null)
-                    {
-                        if (TypeHelper.TMP_TextType != null)
-                            tryCastTMPMethod = tryCastMethod.MakeGenericMethod(TypeHelper.TMP_TextType);
-                        if (TypeHelper.UI_TextType != null)
-                            tryCastTextMethod = tryCastMethod.MakeGenericMethod(TypeHelper.UI_TextType);
-                    }
-
-                    TranslatorCore.LogInfo($"IL2CPP scan initialized (TMP={il2cppTypeTMP != null}, Text={il2cppTypeText != null}, TryCast={tryCastTMPMethod != null})");
-                }
+                    TranslatorCore.LogInfo($"IL2CPP scan initialized (TryCast={tryCastMethod != null})");
                 else
-                {
                     TranslatorCore.LogWarning($"IL2CPP scan not available");
-                }
             }
             catch (Exception e)
             {
@@ -1155,764 +1483,6 @@ namespace UnityGameTranslator.Core
         /// Check if IL2CPP scanning is available.
         /// </summary>
         public static bool IsIL2CPPScanAvailable => il2cppScanAvailable;
-
-        #region Mono Scanning
-
-        /// <summary>
-        /// Scan and translate text components (Mono version) - batched for performance.
-        /// </summary>
-        public static void ScanMono()
-        {
-            // Apply any pending translations from AI (main thread) - always do this
-            ProcessPendingUpdates();
-
-            // Skip scanning if there's no useful work to do
-            if (ShouldSkipScanning())
-                return;
-
-            float currentTime = Time.realtimeSinceStartup;
-
-            // Check if cache refresh is needed
-            bool needsRefresh = cachedTMPMono == null ||
-                               (currentTime - lastComponentCacheTime > COMPONENT_CACHE_DURATION);
-
-            if (needsRefresh)
-            {
-                if (scanCycleComplete)
-                {
-                    RefreshMonoCache();
-                    lastComponentCacheTime = currentTime;
-                    cacheRefreshPending = false;
-                }
-                else
-                {
-                    cacheRefreshPending = true;
-                }
-            }
-
-            if (cacheRefreshPending && scanCycleComplete)
-            {
-                RefreshMonoCache();
-                lastComponentCacheTime = currentTime;
-                cacheRefreshPending = false;
-            }
-
-            try
-            {
-                bool tmpDone = true;
-                bool uiDone = true;
-
-                // Process TMP batch
-                if (cachedTMPMono != null && cachedTMPMono.Length > 0)
-                {
-                    if (currentBatchIndexTMP >= cachedTMPMono.Length)
-                        currentBatchIndexTMP = 0;
-
-                    int endIndex = Math.Min(currentBatchIndexTMP + BATCH_SIZE, cachedTMPMono.Length);
-                    for (int i = currentBatchIndexTMP; i < endIndex; i++)
-                    {
-                        var obj = cachedTMPMono[i];
-                        if (obj == null) continue;
-                        ProcessComponentReflection(obj, "TMP");
-                    }
-
-                    if (endIndex >= cachedTMPMono.Length)
-                        currentBatchIndexTMP = 0;
-                    else
-                    {
-                        currentBatchIndexTMP = endIndex;
-                        tmpDone = false;
-                    }
-                }
-
-                // Process UI batch
-                if (cachedUIMono != null && cachedUIMono.Length > 0)
-                {
-                    if (currentBatchIndexUI >= cachedUIMono.Length)
-                        currentBatchIndexUI = 0;
-
-                    int endIndex = Math.Min(currentBatchIndexUI + BATCH_SIZE, cachedUIMono.Length);
-                    for (int i = currentBatchIndexUI; i < endIndex; i++)
-                    {
-                        var obj = cachedUIMono[i];
-                        if (obj == null) continue;
-                        ProcessComponentReflection(obj, "Unity");
-                    }
-
-                    if (endIndex >= cachedUIMono.Length)
-                        currentBatchIndexUI = 0;
-                    else
-                    {
-                        currentBatchIndexUI = endIndex;
-                        uiDone = false;
-                    }
-                }
-
-                // Generic text types (NGUI UILabel, etc.)
-                bool genericDone = ScanGenericTextTypesBatch();
-
-                scanCycleComplete = tmpDone && uiDone && genericDone;
-            }
-            catch { }
-        }
-
-        private static void RefreshMonoCache()
-        {
-            try
-            {
-                cachedTMPMono = FindAllObjectsOfType(TypeHelper.TMP_TextType);
-                cachedUIMono = FindAllObjectsOfType(TypeHelper.UI_TextType);
-                // Don't reset batch indices - continue from where we were
-            }
-            catch { }
-        }
-
-        /// <summary>
-        /// Find all objects of a given type.
-        /// Delegates to TypeHelper which handles both Mono and IL2CPP correctly.
-        /// </summary>
-        private static UnityEngine.Object[] FindAllObjectsOfType(Type type)
-        {
-            return TypeHelper.FindAllObjectsOfType(type);
-        }
-
-        #endregion
-
-        #region IL2CPP Scanning
-
-        /// <summary>
-        /// Scan and translate text components (IL2CPP version) - batched for performance.
-        /// </summary>
-        // Separate batch indices for Mono fallback caches on IL2CPP
-        private static int il2cppMonoBatchIndexTMP = 0;
-        private static int il2cppMonoBatchIndexUI = 0;
-        private static bool il2cppMonoLoggedTMP = false;
-        private static bool il2cppMonoLoggedUI = false;
-
-        public static void ScanIL2CPP()
-        {
-            // Apply any pending translations from AI (main thread) - always do this
-            ProcessPendingUpdates();
-
-            if (!il2cppMethodsInitialized) InitializeIL2CPP();
-            if (!il2cppScanAvailable) return;
-
-            // Skip scanning if there's no useful work to do
-            if (ShouldSkipScanning())
-                return;
-
-            float currentTime = Time.realtimeSinceStartup;
-
-            // Check if cache refresh is needed
-            bool needsRefresh = cachedTMPComponents == null ||
-                               (currentTime - lastComponentCacheTime > COMPONENT_CACHE_DURATION);
-
-            if (needsRefresh)
-            {
-                if (scanCycleComplete)
-                {
-                    RefreshIL2CPPCache();
-                    // Also refresh Mono caches as fallback (TypeHelper.FindAllObjectsOfType
-                    // often finds more components than the IL2CPP-native scan)
-                    RefreshMonoCache();
-                    lastComponentCacheTime = currentTime;
-                    cacheRefreshPending = false;
-                }
-                else
-                {
-                    cacheRefreshPending = true;
-                }
-            }
-
-            if (cacheRefreshPending && scanCycleComplete)
-            {
-                RefreshIL2CPPCache();
-                RefreshMonoCache();
-                lastComponentCacheTime = currentTime;
-                cacheRefreshPending = false;
-            }
-
-            try
-            {
-                bool tmpDone = true;
-                bool uiDone = true;
-
-                // === IL2CPP native caches ===
-
-                // Process TMP batch (IL2CPP)
-                if (cachedTMPComponents != null && cachedTMPComponents.Length > 0)
-                {
-                    if (!scanLoggedTMP)
-                    {
-                        TranslatorCore.LogInfo($"Scan: Found {cachedTMPComponents.Length} TMP_Text components");
-                        scanLoggedTMP = true;
-                    }
-
-                    if (currentBatchIndexTMP >= cachedTMPComponents.Length)
-                        currentBatchIndexTMP = 0;
-
-                    int endIndex = Math.Min(currentBatchIndexTMP + BATCH_SIZE, cachedTMPComponents.Length);
-                    for (int i = currentBatchIndexTMP; i < endIndex; i++)
-                    {
-                        var obj = cachedTMPComponents[i];
-                        if (obj == null) continue;
-
-                        var component = TryCastToType(obj, tryCastTMPMethod);
-                        if (component == null) continue;
-
-                        ProcessComponentReflection(component, "TMP");
-                    }
-
-                    if (endIndex >= cachedTMPComponents.Length)
-                        currentBatchIndexTMP = 0;
-                    else
-                    {
-                        currentBatchIndexTMP = endIndex;
-                        tmpDone = false;
-                    }
-                }
-
-                // Process UI batch (IL2CPP)
-                if (cachedUIComponents != null && cachedUIComponents.Length > 0)
-                {
-                    if (!scanLoggedUI)
-                    {
-                        TranslatorCore.LogInfo($"Scan: Found {cachedUIComponents.Length} UI.Text components");
-                        scanLoggedUI = true;
-                    }
-
-                    if (currentBatchIndexUI >= cachedUIComponents.Length)
-                        currentBatchIndexUI = 0;
-
-                    int endIndex = Math.Min(currentBatchIndexUI + BATCH_SIZE, cachedUIComponents.Length);
-                    for (int i = currentBatchIndexUI; i < endIndex; i++)
-                    {
-                        var obj = cachedUIComponents[i];
-                        if (obj == null) continue;
-
-                        var component = TryCastToType(obj, tryCastTextMethod);
-                        if (component == null) continue;
-
-                        ProcessComponentReflection(component, "Unity");
-                    }
-
-                    if (endIndex >= cachedUIComponents.Length)
-                        currentBatchIndexUI = 0;
-                    else
-                    {
-                        currentBatchIndexUI = endIndex;
-                        uiDone = false;
-                    }
-                }
-
-                // === Mono fallback caches (catches components missed by IL2CPP-native scan) ===
-
-                bool monoTmpDone = true;
-                bool monoUiDone = true;
-
-                // Process TMP batch (Mono fallback)
-                if (cachedTMPMono != null && cachedTMPMono.Length > 0)
-                {
-                    if (!il2cppMonoLoggedTMP)
-                    {
-                        TranslatorCore.LogInfo($"Scan: Found {cachedTMPMono.Length} TMP_Text components (Mono fallback)");
-                        il2cppMonoLoggedTMP = true;
-                    }
-
-                    if (il2cppMonoBatchIndexTMP >= cachedTMPMono.Length)
-                        il2cppMonoBatchIndexTMP = 0;
-
-                    int endIndex = Math.Min(il2cppMonoBatchIndexTMP + BATCH_SIZE, cachedTMPMono.Length);
-                    for (int i = il2cppMonoBatchIndexTMP; i < endIndex; i++)
-                    {
-                        var obj = cachedTMPMono[i];
-                        if (obj == null) continue;
-                        ProcessComponentReflection(obj, "TMP");
-                    }
-
-                    if (endIndex >= cachedTMPMono.Length)
-                        il2cppMonoBatchIndexTMP = 0;
-                    else
-                    {
-                        il2cppMonoBatchIndexTMP = endIndex;
-                        monoTmpDone = false;
-                    }
-                }
-
-                // Process UI batch (Mono fallback)
-                if (cachedUIMono != null && cachedUIMono.Length > 0)
-                {
-                    if (!il2cppMonoLoggedUI)
-                    {
-                        TranslatorCore.LogInfo($"Scan: Found {cachedUIMono.Length} UI.Text components (Mono fallback)");
-                        il2cppMonoLoggedUI = true;
-                    }
-
-                    if (il2cppMonoBatchIndexUI >= cachedUIMono.Length)
-                        il2cppMonoBatchIndexUI = 0;
-
-                    int endIndex = Math.Min(il2cppMonoBatchIndexUI + BATCH_SIZE, cachedUIMono.Length);
-                    for (int i = il2cppMonoBatchIndexUI; i < endIndex; i++)
-                    {
-                        var obj = cachedUIMono[i];
-                        if (obj == null) continue;
-                        ProcessComponentReflection(obj, "Unity");
-                    }
-
-                    if (endIndex >= cachedUIMono.Length)
-                        il2cppMonoBatchIndexUI = 0;
-                    else
-                    {
-                        il2cppMonoBatchIndexUI = endIndex;
-                        monoUiDone = false;
-                    }
-                }
-
-                // === Generic text types (NGUI UILabel, etc.) ===
-                bool genericDone = ScanGenericTextTypesBatch();
-
-                scanCycleComplete = tmpDone && uiDone && monoTmpDone && monoUiDone && genericDone;
-            }
-            catch { }
-        }
-
-        #region Generic Text Type Batch Scanning
-
-        // Cached components per generic text type + batch indices
-        private static readonly Dictionary<Type, UnityEngine.Object[]> _genericTextCaches = new Dictionary<Type, UnityEngine.Object[]>();
-        private static readonly Dictionary<Type, int> _genericTextBatchIndices = new Dictionary<Type, int>();
-        private static bool _genericTextLoggedOnce = false;
-
-        /// <summary>
-        /// Batch-scan all generically detected text types (NGUI UILabel, etc.)
-        /// Uses per-type caches and batch indices.
-        /// Returns true when all types have completed a full cycle.
-        /// </summary>
-        private static bool ScanGenericTextTypesBatch()
-        {
-            var genericTypes = TranslatorPatches.GenericTextTypes;
-            if (genericTypes.Count == 0) return true;
-
-            bool allDone = true;
-
-            foreach (var typeInfo in genericTypes)
-            {
-                try
-                {
-                    // Get or refresh cache for this type
-                    if (!_genericTextCaches.TryGetValue(typeInfo.ComponentType, out var cache) || cache == null)
-                    {
-                        cache = FindGenericTextComponents(typeInfo);
-                        _genericTextCaches[typeInfo.ComponentType] = cache;
-
-                        if (!_genericTextLoggedOnce && cache != null && cache.Length > 0)
-                        {
-                            TranslatorCore.LogInfo($"Scan: Found {cache.Length} {typeInfo.FrameworkName} ({typeInfo.ComponentType.Name}) components");
-                            _genericTextLoggedOnce = true;
-                        }
-                    }
-
-                    if (cache == null || cache.Length == 0) continue;
-
-                    // Get batch index
-                    if (!_genericTextBatchIndices.TryGetValue(typeInfo.ComponentType, out int batchIndex))
-                        batchIndex = 0;
-                    if (batchIndex >= cache.Length)
-                        batchIndex = 0;
-
-                    int endIndex = Math.Min(batchIndex + BATCH_SIZE, cache.Length);
-                    for (int i = batchIndex; i < endIndex; i++)
-                    {
-                        var obj = cache[i];
-                        if (obj == null) continue;
-
-                        try
-                        {
-                            var comp = obj as Component;
-                            if (comp == null) continue;
-                            if (TranslatorCore.ShouldSkipTranslation(comp)) continue;
-
-                            int instanceId = comp.GetInstanceID();
-                            if (inputFieldTextIds.Contains(instanceId)) continue;
-
-                            // Get text via the type's own property (not TypeHelper which doesn't know this type)
-                            string currentText = typeInfo.TextProp.GetValue(obj, null) as string;
-                            if (string.IsNullOrEmpty(currentText) || currentText.Length < 2) continue;
-
-                            int textHash = currentText.GetHashCode();
-                            if (processedTextHashes.TryGetValue(instanceId, out int lastHash) && lastHash == textHash)
-                                continue;
-
-                            if (TranslatorCore.HasSeenText(instanceId, currentText, out _))
-                            {
-                                processedTextHashes[instanceId] = textHash;
-                                continue;
-                            }
-
-                            bool isOwnUI = TranslatorCore.IsOwnUITranslatable(comp);
-                            string translated = TranslatorCore.TranslateTextWithTracking(currentText, comp, isOwnUI);
-                            if (translated != currentText)
-                            {
-                                typeInfo.TextProp.SetValue(obj, translated, null);
-                                TranslatorCore.UpdateSeenText(instanceId, translated);
-                                processedTextHashes[instanceId] = translated.GetHashCode();
-                            }
-                            else
-                            {
-                                TranslatorCore.UpdateSeenText(instanceId, currentText);
-                                processedTextHashes[instanceId] = textHash;
-                            }
-                        }
-                        catch { }
-                    }
-
-                    if (endIndex >= cache.Length)
-                    {
-                        _genericTextBatchIndices[typeInfo.ComponentType] = 0;
-                        // Invalidate cache so it refreshes next cycle
-                        _genericTextCaches[typeInfo.ComponentType] = null;
-                    }
-                    else
-                    {
-                        _genericTextBatchIndices[typeInfo.ComponentType] = endIndex;
-                        allDone = false;
-                    }
-                }
-                catch { }
-            }
-
-            return allDone;
-        }
-
-        /// <summary>
-        /// Find all instances of a generic text component type.
-        /// Tries multiple approaches: static list field, IL2CPP scan, TypeHelper fallback.
-        /// </summary>
-        private static bool _genericScanLoggedOnce = false;
-
-        private static UnityEngine.Object[] FindGenericTextComponents(GenericTextTypeInfo typeInfo)
-        {
-            var type = typeInfo.ComponentType;
-
-            // Approach 1: Check for static list fields (NGUI UILabel.mList, etc.)
-            try
-            {
-                var staticFields = type.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-
-                // Known static list field names per framework
-                string[] listFieldNames = { "mList", "sList", "s_Instances", "instances", "allInstances", "s_list" };
-
-                foreach (var field in staticFields)
-                {
-                    var fieldType = field.FieldType;
-                    if (fieldType == null) continue;
-
-                    // Match by field name (known patterns) OR by type name (contains list/array)
-                    bool nameMatch = false;
-                    foreach (var knownName in listFieldNames)
-                    {
-                        if (string.Equals(field.Name, knownName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            nameMatch = true;
-                            break;
-                        }
-                    }
-
-                    if (!nameMatch)
-                    {
-                        // Also check type name for list-like patterns
-                        string ftName = fieldType.Name ?? "";
-                        if (!ftName.Contains("List") && !ftName.Contains("Array") &&
-                            !ftName.Contains("Collection") && !ftName.Contains("HashSet"))
-                            continue;
-                    }
-
-                    object listObj = null;
-                    try { listObj = field.GetValue(null); }
-                    catch (Exception ex)
-                    {
-                        if (!_genericScanLoggedOnce)
-                            TranslatorCore.LogWarning($"[Scanner] {typeInfo.FrameworkName}: field '{field.Name}' GetValue failed: {ex.Message}");
-                        continue;
-                    }
-
-                    if (listObj == null) continue;
-
-                    if (!_genericScanLoggedOnce)
-                        TranslatorCore.LogInfo($"[Scanner] {typeInfo.FrameworkName}: trying field '{field.Name}' (type: {listObj.GetType().Name})");
-
-                    var items = ExtractObjectsFromList(listObj, type);
-                    if (items != null && items.Length > 0)
-                    {
-                        TranslatorCore.LogInfo($"[Scanner] Found {items.Length} {typeInfo.FrameworkName} via static field '{field.Name}'");
-                        _genericScanLoggedOnce = true;
-                        return items;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                if (!_genericScanLoggedOnce)
-                    TranslatorCore.LogWarning($"[Scanner] {typeInfo.FrameworkName} static field scan error: {ex.Message}");
-            }
-
-            // Approach 2: IL2CPP native scan via FindObjectsOfTypeAll
-            try
-            {
-                var il2cppType = GetIL2CPPTypeFor(type);
-                var result = FindAllComponentsIL2CPPCached(il2cppType);
-                if (result != null && result.Length > 0)
-                {
-                    if (!_genericScanLoggedOnce)
-                        TranslatorCore.LogInfo($"[Scanner] {typeInfo.FrameworkName}: found {result.Length} via IL2CPP scan");
-                    _genericScanLoggedOnce = true;
-                    return result;
-                }
-            }
-            catch { }
-
-            // Approach 3: TypeHelper fallback
-            try
-            {
-                var result = TypeHelper.FindAllObjectsOfType(type);
-                if (result != null && result.Length > 0)
-                {
-                    if (!_genericScanLoggedOnce)
-                        TranslatorCore.LogInfo($"[Scanner] {typeInfo.FrameworkName}: found {result.Length} via TypeHelper");
-                    _genericScanLoggedOnce = true;
-                    return result;
-                }
-            }
-            catch { }
-
-            // Approach 4: Scan all MonoBehaviours and filter by type
-            // This is slower but works universally on IL2CPP where type-specific
-            // FindObjectsOfTypeAll fails for game/third-party types
-            try
-            {
-                var allMonoBehaviours = TypeHelper.FindAllObjectsOfType(typeof(MonoBehaviour));
-                if (allMonoBehaviours != null && allMonoBehaviours.Length > 0)
-                {
-                    var filtered = new List<UnityEngine.Object>();
-                    foreach (var obj in allMonoBehaviours)
-                    {
-                        if (obj == null) continue;
-                        if (type.IsInstanceOfType(obj))
-                            filtered.Add(obj);
-                    }
-                    if (filtered.Count > 0)
-                    {
-                        TranslatorCore.LogInfo($"[Scanner] Found {filtered.Count} {typeInfo.FrameworkName} via MonoBehaviour filter (from {allMonoBehaviours.Length} total)");
-                        _genericScanLoggedOnce = true;
-                        return filtered.ToArray();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                if (!_genericScanLoggedOnce)
-                    TranslatorCore.LogWarning($"[Scanner] {typeInfo.FrameworkName}: MonoBehaviour filter failed: {ex.Message}");
-            }
-
-            if (!_genericScanLoggedOnce)
-            {
-                TranslatorCore.LogWarning($"[Scanner] {typeInfo.FrameworkName}: all scan methods failed for {type.Name}");
-                _genericScanLoggedOnce = true;
-            }
-            return null;
-        }
-
-        /// <summary>
-        /// Extract UnityEngine.Object instances from a list/collection object.
-        /// Handles BetterList (NGUI), List, arrays, etc.
-        /// </summary>
-        private static UnityEngine.Object[] ExtractObjectsFromList(object listObj, Type expectedType)
-        {
-            try
-            {
-                var results = new List<UnityEngine.Object>();
-
-                // Try 'buffer' field + 'size' field (BetterList pattern from NGUI)
-                var bufferField = listObj.GetType().GetField("buffer", BindingFlags.Public | BindingFlags.Instance);
-                var sizeField = listObj.GetType().GetField("size", BindingFlags.Public | BindingFlags.Instance);
-                if (bufferField != null && sizeField != null)
-                {
-                    var buffer = bufferField.GetValue(listObj);
-                    var size = sizeField.GetValue(listObj);
-                    if (buffer is System.Collections.IEnumerable enumerable && size is int count)
-                    {
-                        int idx = 0;
-                        foreach (var item in enumerable)
-                        {
-                            if (idx >= count) break;
-                            if (item is UnityEngine.Object uobj)
-                                results.Add(uobj);
-                            idx++;
-                        }
-                        if (results.Count > 0) return results.ToArray();
-                    }
-                }
-
-                // Try IEnumerable directly (List<T>, etc.)
-                if (listObj is System.Collections.IEnumerable directEnum)
-                {
-                    foreach (var item in directEnum)
-                    {
-                        if (item is UnityEngine.Object uobj)
-                            results.Add(uobj);
-                    }
-                    if (results.Count > 0) return results.ToArray();
-                }
-
-                // Try Count + Item indexer pattern
-                var countProp = listObj.GetType().GetProperty("Count");
-                var itemProp = listObj.GetType().GetProperty("Item");
-                if (countProp != null && itemProp != null)
-                {
-                    int count2 = (int)countProp.GetValue(listObj, null);
-                    for (int i = 0; i < count2; i++)
-                    {
-                        var item = itemProp.GetValue(listObj, new object[] { i });
-                        if (item is UnityEngine.Object uobj)
-                            results.Add(uobj);
-                    }
-                    if (results.Count > 0) return results.ToArray();
-                }
-            }
-            catch { }
-
-            return null;
-        }
-
-        /// <summary>
-        /// Get the IL2CPP type representation for a managed type (for FindObjectsOfTypeAll).
-        /// Uses the same Il2CppType.Of method cached during InitializeIL2CPP.
-        /// </summary>
-        private static object GetIL2CPPTypeFor(Type managedType)
-        {
-            if (managedType == null || il2cppTypeOfMethod == null) return null;
-            try
-            {
-                return il2cppTypeOfMethod.MakeGenericMethod(managedType).Invoke(null, null);
-            }
-            catch { return null; }
-        }
-
-        #endregion
-
-        private static void RefreshIL2CPPCache()
-        {
-            try
-            {
-                cachedTMPComponents = FindAllComponentsIL2CPPCached(il2cppTypeTMP);
-                cachedUIComponents = FindAllComponentsIL2CPPCached(il2cppTypeText);
-                // Don't reset batch indices - continue from where we were
-                // The Min() check in the scan loop handles size changes gracefully
-            }
-            catch { }
-        }
-
-        #endregion
-
-        #region Component Processing
-
-        // Debug: track how many times we've logged for InputField detection
-        private static int inputFieldDebugLogCount = 0;
-        private const int MAX_INPUTFIELD_DEBUG_LOGS = 50;
-        private static int _scanDiagCount = 0;
-
-        /// <summary>
-        /// Unified component processing via reflection.
-        /// Works for TMP_Text, UI.Text, and any component type resolved by TypeHelper.
-        /// </summary>
-        private static void ProcessComponentReflection(object component, string componentType)
-        {
-            try
-            {
-                var comp = component as Component;
-                if (comp == null) return;
-
-                int instanceId = comp.GetInstanceID();
-
-                // Skip if own UI and should not be translated (uses hierarchy check)
-                if (TranslatorCore.ShouldSkipTranslation(comp))
-                    return;
-
-                // Skip if translation disabled for this font
-                string fontName = TypeHelper.GetFontName(component);
-                if (!string.IsNullOrEmpty(fontName) && !FontManager.IsTranslationEnabled(fontName))
-                    return;
-
-                // Skip if already identified as InputField user text (not placeholder)
-                if (inputFieldTextIds.Contains(instanceId))
-                    return;
-
-                // First-time check: is this the textComponent of an InputField?
-                if (TypeHelper.IsInputFieldTextComponent(component))
-                {
-                    inputFieldTextIds.Add(instanceId);
-                    TranslatorCore.LogInfo($"[Scanner] Excluded InputField textComponent: {comp.gameObject.name}");
-                    return;
-                }
-
-                string currentText = TypeHelper.GetText(component);
-
-                // Diagnostic: log first N texts found by scanner to verify what's being read
-                if (_scanDiagCount < 30)
-                {
-                    string preview = currentText != null ? (currentText.Length > 30 ? currentText.Substring(0, 30) + "..." : currentText) : "(null)";
-                    bool isNumSym = !string.IsNullOrEmpty(currentText) && TranslatorCore.IsNumericOrSymbol(currentText);
-                    TranslatorCore.LogInfo($"[ScanDiag] {componentType} id={instanceId} len={currentText?.Length ?? 0} numSym={isNumSym} text='{preview}'");
-                    _scanDiagCount++;
-                }
-
-                if (string.IsNullOrEmpty(currentText) || currentText.Length < 2) return;
-
-                // Debug log for UI.Text
-                if (componentType == "Unity" && inputFieldDebugLogCount < MAX_INPUTFIELD_DEBUG_LOGS)
-                {
-                    var parentNames = GetParentHierarchy(comp.gameObject, 5);
-                    TranslatorCore.LogInfo($"[Scanner] Text NOT in InputField: '{comp.gameObject.name}' hierarchy: {parentNames}");
-                    inputFieldDebugLogCount++;
-                }
-
-                int textHash = currentText.GetHashCode();
-
-                // Quick skip: already processed with same text
-                if (processedTextHashes.TryGetValue(instanceId, out int lastHash) && lastHash == textHash)
-                    return;
-
-                // Check if text changed since last seen
-                if (TranslatorCore.HasSeenText(instanceId, currentText, out _))
-                {
-                    processedTextHashes[instanceId] = textHash;
-                    return;
-                }
-
-                // Check if own UI (use UI-specific prompt) - uses hierarchy check
-                bool isOwnUI = TranslatorCore.IsOwnUITranslatable(comp);
-                string translated = TranslatorCore.TranslateTextWithTracking(currentText, comp, isOwnUI);
-                if (translated != currentText)
-                {
-                    TypeHelper.SetText(component, translated);
-
-                    // Force refresh based on component type
-                    if (componentType == "TMP")
-                        TypeHelper.ForceMeshUpdate(component);
-                    else
-                        TypeHelper.SetAllDirty(component);
-
-                    TranslatorCore.UpdateSeenText(instanceId, translated);
-                    processedTextHashes[instanceId] = translated.GetHashCode();
-                }
-                else
-                {
-                    TranslatorCore.UpdateSeenText(instanceId, currentText);
-                    processedTextHashes[instanceId] = textHash;
-                }
-            }
-            catch { }
-        }
 
         #endregion
 
@@ -1943,15 +1513,10 @@ namespace UnityGameTranslator.Core
         /// </summary>
         public static void ProcessPendingUpdates()
         {
-            // Check if a font was just created — clear processed cache
-            // so scan loop re-evaluates all components with the new font
+            // Check if a font was just created - clear processed cache
             if (FontManager.ConsumePendingRefresh())
             {
                 ClearProcessedCache();
-                // Reset batch indices to start from the beginning
-                currentBatchIndexTMP = 0;
-                currentBatchIndexUI = 0;
-                scanCycleComplete = true;
             }
 
             // Process all pending updates immediately
@@ -2001,7 +1566,6 @@ namespace UnityGameTranslator.Core
                     else
                     {
                         // Clear tracking so scanner retries this component on next cycle
-                        // (text was changed/cleared by the game before we could apply)
                         int skipId = TypeHelper.GetInstanceID(comp);
                         if (skipId != -1)
                         {
@@ -2017,47 +1581,14 @@ namespace UnityGameTranslator.Core
 
         #endregion
 
-        #region Debug Helpers
+        #region IL2CPP Helpers
 
         /// <summary>
-        /// Get parent hierarchy as a string for debugging (child -> parent -> grandparent...)
-        /// </summary>
-        private static string GetParentHierarchy(GameObject obj, int maxDepth)
-        {
-            var names = new List<string>();
-            var current = obj.transform;
-            int depth = 0;
-
-            while (current != null && depth < maxDepth)
-            {
-                // Also check if this object has InputField component
-                bool hasInputField = false;
-                if (TypeHelper.UI_InputFieldType != null)
-                    hasInputField = current.GetComponent(TypeHelper.UI_InputFieldType) != null;
-                names.Add(hasInputField ? $"{current.name}[IF]" : current.name);
-                current = current.parent;
-                depth++;
-            }
-
-            return string.Join(" -> ", names);
-        }
-
-        #endregion
-
-        #region IL2CPP Helpers (Optimized)
-
-        /// <summary>
-        /// Try to cast an IL2CPP object to a specific type using the cached TryCast method.
+        /// Try to cast an IL2CPP object to a specific type using a cached TryCast method.
         /// </summary>
         private static object TryCastToType(object obj, MethodInfo typedTryCastMethod)
         {
             if (obj == null || typedTryCastMethod == null) return null;
-
-            // Check if already the right type
-            if (TypeHelper.TMP_TextType != null && TypeHelper.TMP_TextType.IsInstanceOfType(obj))
-                return obj;
-            if (TypeHelper.UI_TextType != null && TypeHelper.UI_TextType.IsInstanceOfType(obj))
-                return obj;
 
             try
             {
@@ -2103,6 +1634,29 @@ namespace UnityGameTranslator.Core
             {
                 return null;
             }
+        }
+
+        #endregion
+
+        #region Legacy API (backward compatibility)
+
+        /// <summary>
+        /// Legacy method - now delegates to Scan().
+        /// Kept for backward compatibility during migration.
+        /// </summary>
+        public static void ScanMono()
+        {
+            Scan();
+        }
+
+        /// <summary>
+        /// Legacy method - now delegates to Scan().
+        /// Kept for backward compatibility during migration.
+        /// </summary>
+        public static void ScanIL2CPP()
+        {
+            if (!il2cppMethodsInitialized) InitializeIL2CPP();
+            Scan();
         }
 
         #endregion

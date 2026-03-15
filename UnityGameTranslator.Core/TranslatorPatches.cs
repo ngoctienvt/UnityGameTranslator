@@ -7,17 +7,30 @@ using UnityEngine;
 namespace UnityGameTranslator.Core
 {
     /// <summary>
-    /// Info about a generically detected text component type (NGUI, SuperTextMesh, etc.)
+    /// Unified descriptor for any text component type the scanner should process.
+    /// Covers built-in types (TMP, UI.Text, TextMesh) and generically detected types (NGUI, SuperTextMesh, etc.)
     /// </summary>
-    public class GenericTextTypeInfo
+    public class RegisteredTextType
     {
+        public string Name { get; set; }                    // "TMP_Text", "UI.Text", "UILabel"
+        public string Category { get; set; }                // "TMP", "Unity", "TextMesh", "NGUI", "Custom"
         public Type ComponentType { get; set; }
         public PropertyInfo TextProp { get; set; }          // .text (string get/set)
         public PropertyInfo FontProp { get; set; }          // .font or .trueTypeFont (Font)
         public PropertyInfo FontSizeProp { get; set; }      // .fontSize (int or float)
         public PropertyInfo ColorProp { get; set; }         // .color (Color)
-        public string FrameworkName { get; set; }           // "NGUI", "Custom", etc.
         public string FontTypeName { get; set; }            // For FontManager registration
+        public bool NeedsForceMeshUpdate { get; set; }      // TMP types need ForceMeshUpdate
+        public bool NeedsSetAllDirty { get; set; }          // UI.Text types need SetAllDirty
+
+        // Per-type scan cache (managed by scanner)
+        internal UnityEngine.Object[] CachedComponents;
+        internal int BatchIndex;
+        internal bool LoggedOnce;
+
+        // IL2CPP specific cache (managed by scanner)
+        internal object IL2CPPType;                          // Cached Il2CppType.Of<T>() result
+        internal MethodInfo TryCastMethod;                   // Cached TryCast<T> generic method
     }
 
     /// <summary>
@@ -35,12 +48,12 @@ namespace UnityGameTranslator.Core
         private static readonly Dictionary<int, float> _originalFontSizes = new Dictionary<int, float>();
 
         // Generically detected text component types (NGUI UILabel, SuperTextMesh, etc.)
-        private static readonly List<GenericTextTypeInfo> _genericTextTypes = new List<GenericTextTypeInfo>();
+        private static readonly List<RegisteredTextType> _genericTextTypes = new List<RegisteredTextType>();
 
         /// <summary>
         /// Get the list of generically detected text types (for scanner integration).
         /// </summary>
-        public static IReadOnlyList<GenericTextTypeInfo> GenericTextTypes => _genericTextTypes;
+        public static IReadOnlyList<RegisteredTextType> GenericTextTypes => _genericTextTypes;
 
         // Types to exclude (known non-text types)
         private static readonly HashSet<string> ExcludedTypeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -244,9 +257,9 @@ namespace UnityGameTranslator.Core
         /// Scan all loaded assemblies for MonoBehaviour types with a 'text' property.
         /// Returns info about each detected type including font/size property access.
         /// </summary>
-        private static List<GenericTextTypeInfo> FindGenericTextTypes()
+        private static List<RegisteredTextType> FindGenericTextTypes()
         {
-            var results = new List<GenericTextTypeInfo>();
+            var results = new List<RegisteredTextType>();
             var pubInst = BindingFlags.Public | BindingFlags.Instance;
 
             // Collect types we already handle (to avoid double-patching)
@@ -346,15 +359,18 @@ namespace UnityGameTranslator.Core
                             // Detect color property
                             PropertyInfo colorProp = type.GetProperty("color", pubInst);
 
-                            var info = new GenericTextTypeInfo
+                            var info = new RegisteredTextType
                             {
+                                Name = cleanName,
+                                Category = framework,
                                 ComponentType = type,
                                 TextProp = textProp,
                                 FontProp = fontProp,
                                 FontSizeProp = fontSizeProp,
                                 ColorProp = colorProp,
-                                FrameworkName = framework,
-                                FontTypeName = framework == "NGUI" ? "NGUI" : $"Custom ({cleanName})"
+                                FontTypeName = framework == "NGUI" ? "NGUI" : $"Custom ({cleanName})",
+                                NeedsForceMeshUpdate = false,
+                                NeedsSetAllDirty = false
                             };
 
                             results.Add(info);
@@ -389,7 +405,7 @@ namespace UnityGameTranslator.Core
         /// <summary>
         /// Patch a generically detected text type's set_text with our prefix.
         /// </summary>
-        private static int PatchGenericTextType(GenericTextTypeInfo typeInfo, Action<MethodInfo, MethodInfo, MethodInfo> patcher)
+        private static int PatchGenericTextType(RegisteredTextType typeInfo, Action<MethodInfo, MethodInfo, MethodInfo> patcher)
         {
             int patched = 0;
             try
@@ -401,7 +417,7 @@ namespace UnityGameTranslator.Core
                         BindingFlags.Static | BindingFlags.Public);
                     patcher(setMethod, prefix, null);
                     patched++;
-                    TranslatorCore.LogInfo($"[Patches] Patched {typeInfo.FrameworkName}: {typeInfo.ComponentType.Name}.set_text");
+                    TranslatorCore.LogInfo($"[Patches] Patched {typeInfo.Category}: {typeInfo.ComponentType.Name}.set_text");
                 }
 
                 // Also patch get_text for scanner (catches pre-loaded text)
@@ -513,9 +529,9 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Find the GenericTextTypeInfo matching an instance's type.
+        /// Find the RegisteredTextType matching an instance's type.
         /// </summary>
-        private static GenericTextTypeInfo FindTypeInfoForInstance(object instance)
+        private static RegisteredTextType FindTypeInfoForInstance(object instance)
         {
             if (instance == null) return null;
             var type = instance.GetType();
@@ -530,7 +546,7 @@ namespace UnityGameTranslator.Core
         /// <summary>
         /// Apply font scale for a generic text component using its detected fontSize property.
         /// </summary>
-        private static void ApplyGenericFontScale(object instance, GenericTextTypeInfo typeInfo, string fontName)
+        private static void ApplyGenericFontScale(object instance, RegisteredTextType typeInfo, string fontName)
         {
             if (typeInfo.FontSizeProp == null || string.IsNullOrEmpty(fontName)) return;
 
@@ -576,7 +592,7 @@ namespace UnityGameTranslator.Core
             catch { }
         }
 
-        private static void SetGenericFontSize(GenericTextTypeInfo typeInfo, object instance, float size)
+        private static void SetGenericFontSize(RegisteredTextType typeInfo, object instance, float size)
         {
             if (typeInfo.FontSizeProp.PropertyType == typeof(int))
                 typeInfo.FontSizeProp.SetValue(instance, (int)Math.Round(size), null);
@@ -1562,6 +1578,10 @@ namespace UnityGameTranslator.Core
 
                         FontManager.RegisterFontByName(settingsFontName, componentType);
                         FontManager.IncrementUsageCount(settingsFontName);
+
+                        // Store Unity Font objects for IL2CPP fallback (FindObjectsOfTypeAll fails)
+                        if (componentType == "Unity")
+                            FontManager.RegisterUnityFontObject(settingsFontName, fontObj);
 
                         // Skip translation if disabled for this font
                         if (!FontManager.IsTranslationEnabled(settingsFontName))

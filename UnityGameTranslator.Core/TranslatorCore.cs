@@ -2192,7 +2192,7 @@ namespace UnityGameTranslator.Core
         public static void QueueForTranslation(string text, object component = null, bool isOwnUI = false)
         {
             if (!Config.enable_ai) return;
-            if (string.IsNullOrEmpty(text) || text.Length < 3) return;
+            if (string.IsNullOrEmpty(text) || text.Length < 2) return;
 
             lock (lockObj)
             {
@@ -2320,7 +2320,7 @@ namespace UnityGameTranslator.Core
                 return patternResult;
             }
 
-            if (Config.enable_ai && !string.IsNullOrEmpty(text) && text.Length >= 3)
+            if (Config.enable_ai && !string.IsNullOrEmpty(text) && text.Length >= 2)
             {
                 // Check reverse cache with NORMALIZED text (translations are stored normalized + trimmed)
                 // TrimEnd because TMP often strips trailing whitespace/newlines when displaying
@@ -2475,7 +2475,7 @@ namespace UnityGameTranslator.Core
             }
 
             // No cache hit - queue for AI if enabled
-            if (Config.enable_ai && !string.IsNullOrEmpty(text) && text.Length >= 3)
+            if (Config.enable_ai && !string.IsNullOrEmpty(text) && text.Length >= 2)
             {
                 // Check reverse cache with NORMALIZED text (translations are stored normalized + trimmed)
                 // TrimEnd because TMP often strips trailing whitespace/newlines when displaying

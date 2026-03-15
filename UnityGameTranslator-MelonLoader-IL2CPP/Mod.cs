@@ -91,7 +91,7 @@ namespace UnityGameTranslator.MelonLoaderIL2CPP
             if (currentTime - lastScanTime > 0.2f)
             {
                 lastScanTime = currentTime;
-                TranslatorScanner.ScanIL2CPP();
+                TranslatorScanner.Scan();
             }
         }
 

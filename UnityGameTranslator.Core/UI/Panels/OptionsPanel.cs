@@ -688,12 +688,20 @@ namespace UnityGameTranslator.Core.UI.Panels
                 }
                 else
                 {
-                    // Unity Font: system fonts only
+                    // Unity Font: game fonts first (works on IL2CPP), then system fonts
+                    var gameUnityFonts = FontManager.GetGameUnityFontNames();
+                    if (gameUnityFonts.Length > 0)
+                    {
+                        options.Add("--- Game Fonts ---");
+                        options.AddRange(gameUnityFonts);
+                    }
                     availableFonts = _systemFonts;
                 }
 
                 if (availableFonts != null && availableFonts.Length > 0)
                 {
+                    if (options.Count > 1)
+                        options.Add("--- System Fonts ---");
                     options.AddRange(availableFonts);
                 }
 
