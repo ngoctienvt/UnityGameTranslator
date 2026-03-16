@@ -86,6 +86,10 @@ namespace UnityGameTranslator.Core
         // Used to apply scale without cumulative errors
         private static readonly Dictionary<int, float> _originalFontSizes = new Dictionary<int, float>();
 
+        // When true, ApplyFontScale bumps fontSize +1 to force font re-rasterization.
+        // Set by ForceFontSizeBump(), reset by ResetFontSizeBump() after the refresh cycle.
+        private static bool _fontSizeBumpActive = false;
+
         // Generically detected text component types (NGUI UILabel, SuperTextMesh, etc.)
         private static readonly List<RegisteredTextType> _genericTextTypes = new List<RegisteredTextType>();
 
@@ -1420,6 +1424,20 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
+        /// Force a font size bump on next ApplyFontScale cycle.
+        /// This triggers Unity to re-rasterize glyphs (needed after fontNames change on IL2CPP).
+        /// </summary>
+        public static void ForceFontSizeBump()
+        {
+            _fontSizeBumpActive = true;
+        }
+
+        public static void ResetFontSizeBump()
+        {
+            _fontSizeBumpActive = false;
+        }
+
+        /// <summary>
         /// Schedule a delayed scan to apply font replacements to TMP components.
         /// Called after scene change to catch early-initialized text.
         /// </summary>
@@ -1564,7 +1582,8 @@ namespace UnityGameTranslator.Core
 
             float scale = FontManager.GetFontScale(fontName);
             // Fast exit: if scale is 1.0 and we haven't stored an original size, nothing to do
-            if (Math.Abs(scale - 1.0f) < 0.001f)
+            // Unless a font size bump is pending (forces re-rasterization after fontNames change)
+            if (Math.Abs(scale - 1.0f) < 0.001f && !_fontSizeBumpActive)
             {
                 int quickId = TypeHelper.GetInstanceID(instance);
                 if (quickId == -1 || !_originalFontSizes.ContainsKey(quickId))
@@ -1581,19 +1600,19 @@ namespace UnityGameTranslator.Core
                 _originalFontSizes[instanceId] = originalSize;
             }
 
-            // Scale = 1.0 means restore original size
-            if (Math.Abs(scale - 1.0f) < 0.001f)
+            float targetSize = originalSize * scale;
+
+            if (_fontSizeBumpActive)
             {
-                float currentSize = TypeHelper.GetFontSize(instance);
-                if (currentSize >= 0 && Math.Abs(currentSize - originalSize) > 0.1f)
-                    TypeHelper.SetFontSize(instance, originalSize);
+                // Font re-rasterization hack: set originalSize+1 to force Unity re-rasterize.
+                // Persists until ResetFontSizeBump() is called after the next natural scan cycle.
+                TypeHelper.SetFontSize(instance, originalSize + 1);
                 return;
             }
 
-            float scaledSize = originalSize * scale;
-            float currentSize2 = TypeHelper.GetFontSize(instance);
-            if (currentSize2 >= 0 && Math.Abs(currentSize2 - scaledSize) > 0.1f)
-                TypeHelper.SetFontSize(instance, scaledSize);
+            float currentSize = TypeHelper.GetFontSize(instance);
+            if (currentSize >= 0 && Math.Abs(currentSize - targetSize) > 0.1f)
+                TypeHelper.SetFontSize(instance, targetSize);
         }
 
         /// <summary>

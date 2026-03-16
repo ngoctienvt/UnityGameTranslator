@@ -465,6 +465,9 @@ namespace UnityGameTranslator.Core
                     _failedFallbackFontNames.Remove(oldFallback);
                 }
 
+                // Restore original fontNames if we modified the game font
+                RestoreOriginalFontNames(fontName);
+
                 // Restore original fonts on ALL components that had this font replaced.
                 // Without this, components keep the old replacement font forever.
                 RestoreAllComponentsForFont(fontName);
@@ -476,8 +479,26 @@ namespace UnityGameTranslator.Core
             // Refresh all text to re-evaluate with new settings
             if (enabledChanged || fallbackChanged)
             {
+                // 1. Normal pass: apply new fontNames + correct scale
+                //    (GetUnityReplacementFont will modify fontNames during this refresh)
+                TranslatorPatches.ClearFontSizeCache();
                 TranslatorScanner.ClearProcessedCache();
                 TranslatorScanner.ForceRefreshAllText();
+
+                // 2. Bump pass: now that fontNames are updated, bump fontSize to force
+                //    Unity to re-rasterize with the NEW font
+                if (fallbackChanged)
+                {
+                    TranslatorPatches.ForceFontSizeBump();
+                    TranslatorScanner.ClearProcessedCache();
+                    TranslatorScanner.ForceRefreshAllText();
+                    TranslatorPatches.ResetFontSizeBump();
+
+                    // 3. Correction pass: apply correct size (undo the +1 bump)
+                    TranslatorPatches.ClearFontSizeCache();
+                    TranslatorScanner.ClearProcessedCache();
+                    TranslatorScanner.ForceRefreshAllText();
+                }
             }
 
             // Save changes
@@ -864,9 +885,97 @@ namespace UnityGameTranslator.Core
         // Track which GameObjects have been converted from UI.Text to TMP
         private static readonly HashSet<int> _convertedToTMP = new HashSet<int>();
 
+        // Original fontNames saved before modification (for restore)
+        private static readonly Dictionary<string, string[]> _originalFontNames = new Dictionary<string, string[]>();
+
         /// <summary>
         /// Check if a font has a fallback configured in settings.
         /// </summary>
+        /// <summary>
+        /// Force all UI.Text components using this font to re-render.
+        /// Sets font to null then back to force Unity to drop cached glyphs.
+        /// </summary>
+        private static void ForceRefreshUITextFont(Font targetFont, string fontName)
+        {
+            try
+            {
+                // All access via reflection to avoid IL2CPP JIT crashes on stripped methods
+                var textType = typeof(UnityEngine.UI.Text);
+                var fontProp = textType.GetProperty("font", BindingFlags.Public | BindingFlags.Instance);
+                var setDirtyMethod = textType.GetMethod("SetVerticesDirty", BindingFlags.Public | BindingFlags.Instance);
+                var setLayoutDirty = textType.GetMethod("SetLayoutDirty", BindingFlags.Public | BindingFlags.Instance);
+
+                if (fontProp == null) return;
+
+                var allTexts = TypeHelper.FindAllObjectsOfType(textType);
+                int refreshed = 0;
+                foreach (var textObj in allTexts)
+                {
+                    if (textObj == null) continue;
+                    var currentFont = fontProp.GetValue(textObj, null);
+                    if (currentFont == null) continue;
+
+                    string currentName = (currentFont is UnityEngine.Object co) ? co.name : null;
+                    if (currentFont != targetFont && currentName != fontName) continue;
+
+                    // Bump fontSize by 1 to force Unity to re-rasterize with new fontNames.
+                    // ApplyFontScale will correct it back on the next text processing cycle.
+                    float origSize = TypeHelper.GetFontSize(textObj);
+                    if (origSize > 0)
+                        TypeHelper.SetFontSize(textObj, origSize + 1);
+
+                    setDirtyMethod?.Invoke(textObj, null);
+                    setLayoutDirty?.Invoke(textObj, null);
+                    refreshed++;
+                }
+
+                // Clear font size cache so ApplyFontScale re-reads and corrects sizes
+                TranslatorPatches.ClearFontSizeCache();
+                TranslatorCore.LogInfo($"[FontManager] Force-refreshed {refreshed} UI.Text components for '{fontName}'");
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogWarning($"[FontManager] ForceRefreshUITextFont failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Restore original fontNames on a game font (undo fontNames modification).
+        /// </summary>
+        public static void RestoreOriginalFontNames(string fontName)
+        {
+            string[] originalNames;
+            if (!_originalFontNames.TryGetValue(fontName, out originalNames))
+                return;
+
+            // Find the font object
+            Font gameFont = null;
+            if (_gameUnityFonts.TryGetValue(fontName, out gameFont) || true)
+            {
+                if (gameFont == null)
+                {
+                    var allFonts = TypeHelper.FindAllObjectsOfType(typeof(Font));
+                    foreach (var f in allFonts)
+                    {
+                        if (f != null && f.name == fontName)
+                        {
+                            gameFont = f as Font;
+                            break;
+                        }
+                    }
+                }
+
+                if (gameFont != null)
+                {
+                    UniverseLib.Runtime.TextureHelper.SetFontNames(gameFont, originalNames);
+                    ForceRefreshUITextFont(gameFont, fontName);
+                    TranslatorCore.LogInfo($"[FontManager] Restored fontNames for '{fontName}': [{string.Join(", ", originalNames)}]");
+                }
+            }
+
+            _originalFontNames.Remove(fontName);
+        }
+
         public static bool IsCreatedFallbackFont(string fontName)
         {
             if (string.IsNullOrEmpty(fontName)) return false;
@@ -1179,71 +1288,49 @@ namespace UnityGameTranslator.Core
                         catch { }
                     }
 
-                    // Modify the original font's fontNames
+                    // Save original fontNames BEFORE modifying (only first time)
+                    if (!_originalFontNames.ContainsKey(originalFontName))
+                    {
+                        try
+                        {
+                            var fnProp = typeof(Font).GetProperty("fontNames", BindingFlags.Public | BindingFlags.Instance);
+                            if (fnProp != null)
+                            {
+                                var origNamesObj = fnProp.GetValue(originalGameFont, null);
+                                if (origNamesObj != null)
+                                {
+                                    var lenProp = origNamesObj.GetType().GetProperty("Length") ?? origNamesObj.GetType().GetProperty("Count");
+                                    int len = lenProp != null ? (int)lenProp.GetValue(origNamesObj, null) : 0;
+                                    var saved = new string[len];
+                                    var indexer = origNamesObj.GetType().GetProperty("Item");
+                                    for (int fn = 0; fn < len; fn++)
+                                    {
+                                        if (indexer != null)
+                                            saved[fn] = indexer.GetValue(origNamesObj, new object[] { fn })?.ToString();
+                                        else if (origNamesObj is string[] strArr)
+                                            saved[fn] = strArr[fn];
+                                    }
+                                    _originalFontNames[originalFontName] = saved;
+                                    TranslatorCore.LogInfo($"[FontManager] Saved original fontNames for '{originalFontName}': [{string.Join(", ", saved)}]");
+                                }
+                            }
+                        }
+                        catch (Exception saveEx)
+                        {
+                            TranslatorCore.LogWarning($"[FontManager] Failed to save fontNames: {saveEx.Message}");
+                        }
+                    }
+
+                    // Now modify the font's fontNames
                     bool set = UniverseLib.Runtime.TextureHelper.SetFontNames(
                         originalGameFont, new string[] { realFontName, cleanFallback });
                     TranslatorCore.LogInfo($"[FontManager] Modified original font '{originalFontName}' fontNames=[{realFontName}, {cleanFallback}], set={set}");
 
                     if (set)
                     {
-                        // Clear the font's atlas texture to force complete re-rasterization
-                        // with the new fontNames. Without this, Unity reuses cached glyphs.
-                        try
-                        {
-                            var fontMat = originalGameFont.material;
-                            if (fontMat != null && fontMat.mainTexture is Texture2D atlasTex)
-                            {
-                                // Reinitialize the atlas texture to clear all cached glyphs
-                                var reinitMethod = typeof(Texture2D).GetMethod("Reinitialize",
-                                    BindingFlags.Public | BindingFlags.Instance,
-                                    null, new Type[] { typeof(int), typeof(int) }, null);
 
-                                if (reinitMethod != null)
-                                {
-                                    reinitMethod.Invoke(atlasTex, new object[] { atlasTex.width, atlasTex.height });
-                                    TranslatorCore.LogInfo($"[FontManager] Cleared font atlas texture ({atlasTex.width}x{atlasTex.height})");
-                                }
-                                else
-                                {
-                                    // Fallback: Resize (available in older Unity)
-                                    var resizeMethod = typeof(Texture2D).GetMethod("Resize",
-                                        BindingFlags.Public | BindingFlags.Instance,
-                                        null, new Type[] { typeof(int), typeof(int) }, null);
-                                    if (resizeMethod != null)
-                                    {
-                                        resizeMethod.Invoke(atlasTex, new object[] { atlasTex.width, atlasTex.height });
-                                        TranslatorCore.LogInfo($"[FontManager] Resized font atlas to clear cache");
-                                    }
-                                }
-                            }
-                        }
-                        catch (Exception clearEx)
-                        {
-                            TranslatorCore.LogWarning($"[FontManager] Failed to clear atlas: {clearEx.Message}");
-                        }
-
-                        // Force all UI.Text components using this font to rebuild
-                        try
-                        {
-                            var allTexts = TypeHelper.FindAllObjectsOfType(typeof(UnityEngine.UI.Text));
-                            int refreshed = 0;
-                            foreach (var textObj in allTexts)
-                            {
-                                var text = textObj as UnityEngine.UI.Text;
-                                if (text == null || text.font == null) continue;
-                                if (text.font == originalGameFont || text.font.name == originalFontName)
-                                {
-                                    text.font = originalGameFont;
-                                    text.SetAllDirty();
-                                    refreshed++;
-                                }
-                            }
-                            TranslatorCore.LogInfo($"[FontManager] Refreshed {refreshed} UI.Text components");
-                        }
-                        catch (Exception refreshEx)
-                        {
-                            TranslatorCore.LogWarning($"[FontManager] Failed to refresh: {refreshEx.Message}");
-                        }
+                        // Don't bump here — the first scan will rasterize naturally with the new fontNames.
+                        // ForceFontSizeBump is only needed in UpdateFontSettings for hot-swap.
 
                         replacementFont = originalGameFont;
                     }
