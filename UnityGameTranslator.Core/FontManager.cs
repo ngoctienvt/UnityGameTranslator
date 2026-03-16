@@ -641,9 +641,17 @@ namespace UnityGameTranslator.Core
         /// Apply font replacement: SetFont to the replacement, add original as fallback.
         /// Stores original font for runtime restore.
         /// </summary>
+        // Cache of components already font-replaced (avoids reflection GetFontName on every set_text)
+        private static readonly HashSet<int> _fontReplacedComponentIds = new HashSet<int>();
+
         public static void ApplyFontReplacement(object component, object originalFontObj, string originalFontName)
         {
             if (component == null || string.IsNullOrEmpty(originalFontName)) return;
+
+            // Fast check: already replaced this component (skip all reflection)
+            int instanceId = TypeHelper.GetInstanceID(component);
+            if (instanceId != -1 && _fontReplacedComponentIds.Contains(instanceId))
+                return;
 
             var replacementFont = GetTMPReplacementFont(originalFontName);
             if (replacementFont == null) return;
@@ -651,10 +659,13 @@ namespace UnityGameTranslator.Core
             // Don't re-apply if already replaced with the right font
             string currentFontName = TypeHelper.GetFontName(component);
             string replacementName = (replacementFont is UnityEngine.Object rObj) ? rObj.name : null;
-            if (currentFontName == replacementName) return;
+            if (currentFontName == replacementName)
+            {
+                if (instanceId != -1) _fontReplacedComponentIds.Add(instanceId);
+                return;
+            }
 
             // Store original font for this component (for restore)
-            int instanceId = TypeHelper.GetInstanceID(component);
             if (instanceId != -1 && !_originalFontsPerComponent.ContainsKey(instanceId))
             {
                 _originalFontsPerComponent[instanceId] = originalFontObj;
@@ -662,6 +673,10 @@ namespace UnityGameTranslator.Core
 
             // SetFont to replacement
             TypeHelper.SetFont(component, replacementFont);
+
+            // Mark as replaced (skip reflection on subsequent set_text calls)
+            if (instanceId != -1)
+                _fontReplacedComponentIds.Add(instanceId);
 
             // Set fontSharedMaterial to match the replacement font's material
             // Without this, TMP renders with the old font's atlas/shader → empty rectangles
@@ -709,6 +724,7 @@ namespace UnityGameTranslator.Core
                 SetFontSharedMaterial(component, originalFont);
                 TypeHelper.ForceMeshUpdate(component);
                 _originalFontsPerComponent.Remove(instanceId);
+                _fontReplacedComponentIds.Remove(instanceId);
             }
         }
 

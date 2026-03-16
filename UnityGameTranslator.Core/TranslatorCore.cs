@@ -261,21 +261,38 @@ namespace UnityGameTranslator.Core
                 ownUIPanelRoots.Add(panelRoot.GetInstanceID());
         }
 
+        // Cache for IsOwnUIByHierarchy results (avoids repeated hierarchy traversal)
+        // Key: component instanceId, Value: is own UI
+        // Cleared on scene change (components become invalid)
+        private static readonly Dictionary<int, bool> _ownUIHierarchyCache = new Dictionary<int, bool>();
+
         /// <summary>
         /// Check if a component is part of our UI by traversing up the hierarchy.
         /// Returns true if any parent is a registered panel root.
+        /// Results are cached per instanceId to avoid repeated traversal.
         /// </summary>
         public static bool IsOwnUIByHierarchy(Component component)
         {
             if (component == null) return false;
+
+            int id = component.GetInstanceID();
+            if (_ownUIHierarchyCache.TryGetValue(id, out bool cached))
+                return cached;
+
+            bool result = false;
             Transform current = component.transform;
             while (current != null)
             {
                 if (ownUIPanelRoots.Contains(current.gameObject.GetInstanceID()))
-                    return true;
+                {
+                    result = true;
+                    break;
+                }
                 current = current.parent;
             }
-            return false;
+
+            _ownUIHierarchyCache[id] = result;
+            return result;
         }
 
         #region User Exclusions
@@ -631,6 +648,7 @@ namespace UnityGameTranslator.Core
         public static void OnSceneChanged(string sceneName)
         {
             lastSeenText.Clear();
+            _ownUIHierarchyCache.Clear();
             TranslatorScanner.OnSceneChange();
             TranslatorPatches.ClearCache();
 
@@ -2366,10 +2384,8 @@ namespace UnityGameTranslator.Core
             if (string.IsNullOrEmpty(text) || text.Length < 2)
                 return text;
 
-            if (IsNumericOrSymbol(text))
-                return text;
-
             // Don't split multiline - treat as single unit for proper component tracking
+            // (IsNumericOrSymbol check is in TranslateSingleTextWithTracking — no need to call twice)
             string result = TranslateSingleTextWithTracking(text, component, isOwnUI);
             if (result != text)
                 translatedCount++;
@@ -2384,7 +2400,28 @@ namespace UnityGameTranslator.Core
             if (IsNumericOrSymbol(text))
                 return text;
 
-            // Normalize line endings FIRST (for cross-platform consistency)
+            // Fast path: try exact text lookup BEFORE any normalization (avoids allocations for cache hits)
+            if (TranslationCache.TryGetValue(text, out var exactEntry))
+            {
+                if (exactEntry.IsHumanEmpty || exactEntry.Tag == "S")
+                {
+                    cacheHitCount++;
+                    return text;
+                }
+                if (exactEntry.Value != text)
+                {
+                    cacheHitCount++;
+                    translatedCount++;
+                    if (component != null)
+                        TranslatorScanner.StoreOriginalText(component, text);
+                    return exactEntry.Value;
+                }
+                // key == value: no translation needed, return as-is
+                cacheHitCount++;
+                return text;
+            }
+
+            // Normalize line endings (for cross-platform consistency)
             // Cache keys are stored with normalized line endings (\n only)
             string lineNormalized = NormalizeLineEndings(text);
 

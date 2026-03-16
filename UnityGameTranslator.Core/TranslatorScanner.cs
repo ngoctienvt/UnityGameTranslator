@@ -97,10 +97,6 @@ namespace UnityGameTranslator.Core
         private const float COMPONENT_CACHE_DURATION = 2f;
         private static bool cacheRefreshPending = false;
 
-        // Spread refresh: index of the next type to refresh (one per Scan() call)
-        private static int _nextRefreshTypeIndex = 0;
-        private static bool _refreshCycleInProgress = false;
-
         #endregion
 
         #region Quick Skip Cache
@@ -108,6 +104,11 @@ namespace UnityGameTranslator.Core
         // Track objects that have been processed and haven't changed
         // Key: instanceId, Value: last processed text hash
         private static Dictionary<int, int> processedTextHashes = new Dictionary<int, int>();
+
+        // Per-cycle dedup: prevents processing same component through overlapping types
+        // (e.g. TMP_Text scan returns TextMeshProUGUI components, which also have their own type entry)
+        // Cleared at start of each Scan() call.
+        private static readonly HashSet<int> _processedThisCycle = new HashSet<int>();
 
         // Track InputField text components (user input, not placeholder) - never translate these
         private static HashSet<int> inputFieldTextIds = new HashSet<int>();
@@ -152,12 +153,8 @@ namespace UnityGameTranslator.Core
                 type.CachedComponents = null;
                 type.BatchIndex = 0;
                 type.LoggedOnce = false;
-                type.WinningStrategy = ScanStrategy.Unknown;
+                type.ResetStrategyStates();
             }
-
-            // Reset spread refresh state
-            _nextRefreshTypeIndex = 0;
-            _refreshCycleInProgress = false;
 
             // Clear pending updates (components from old scene are invalid)
             lock (pendingUpdatesLock)
@@ -211,8 +208,15 @@ namespace UnityGameTranslator.Core
         /// <summary>
         /// Unified scan method - replaces ScanMono() and ScanIL2CPP().
         /// Works for both Mono and IL2CPP runtimes.
-        /// Uses spread refresh: only one type cache is refreshed per call to avoid frame spikes.
         /// </summary>
+        // === PROFILING (activate via debug file in plugin folder) ===
+        private static readonly System.Diagnostics.Stopwatch _scanProfSw = new System.Diagnostics.Stopwatch();
+        private static long _scanProfRefreshTicks = 0;
+        private static long _scanProfBatchTicks = 0;
+        private static int _scanProfCount = 0;
+        private static int _scanProfRefreshCount = 0;
+        private static float _scanProfLastLog = 0f;
+
         public static void Scan()
         {
             // Apply any pending translations from AI (main thread) - always do this
@@ -225,65 +229,50 @@ namespace UnityGameTranslator.Core
             if (ShouldSkipScanning())
                 return;
 
+            bool profiling = TranslatorCore.DebugMode;
+            if (profiling) _scanProfSw.Restart();
             float currentTime = Time.realtimeSinceStartup;
 
-            // Check if cache refresh is needed (spread: one type per Scan() call)
+            // Check if cache refresh is needed
             bool needsRefresh = (currentTime - lastComponentCacheTime > COMPONENT_CACHE_DURATION);
 
-            // Some types may have null caches on first run — trigger immediate refresh cycle
-            if (!needsRefresh && !_refreshCycleInProgress)
+            // First run: force refresh if cache was never populated
+            // (uses lastComponentCacheTime == 0 instead of checking CachedComponents == null
+            // because null is a valid state for types with no components in the scene)
+            if (!needsRefresh && lastComponentCacheTime == 0f)
             {
-                foreach (var type in _registeredTypes)
-                {
-                    if (type.CachedComponents == null)
-                    {
-                        needsRefresh = true;
-                        break;
-                    }
-                }
+                needsRefresh = true;
             }
 
-            // Start a new refresh cycle if needed
-            if (needsRefresh && !_refreshCycleInProgress)
+            if (needsRefresh)
             {
-                _refreshCycleInProgress = true;
-                _nextRefreshTypeIndex = 0;
-            }
-
-            // Spread refresh: refresh ONE type per Scan() call
-            if (_refreshCycleInProgress && _registeredTypes.Count > 0)
-            {
-                if (_nextRefreshTypeIndex < _registeredTypes.Count)
+                if (scanCycleComplete)
                 {
-                    var type = _registeredTypes[_nextRefreshTypeIndex];
-                    type.CachedComponents = RefreshTypeCache(type);
-                    if (!type.LoggedOnce && type.CachedComponents != null && type.CachedComponents.Length > 0)
-                    {
-                        TranslatorCore.LogInfo($"Scan: Found {type.CachedComponents.Length} {type.Name} components");
-                        type.LoggedOnce = true;
-                    }
-                    _nextRefreshTypeIndex++;
-                }
-
-                // Check if refresh cycle is complete
-                if (_nextRefreshTypeIndex >= _registeredTypes.Count)
-                {
-                    _refreshCycleInProgress = false;
+                    RefreshAllCaches();
                     lastComponentCacheTime = currentTime;
                     cacheRefreshPending = false;
+                    _scanProfRefreshCount++;
+                }
+                else
+                {
+                    cacheRefreshPending = true;
                 }
             }
-
-            // Handle deferred refresh (scan cycle wasn't complete when refresh was needed)
-            if (cacheRefreshPending && scanCycleComplete && !_refreshCycleInProgress)
+            else if (cacheRefreshPending && scanCycleComplete)
             {
-                _refreshCycleInProgress = true;
-                _nextRefreshTypeIndex = 0;
+                RefreshAllCaches();
+                lastComponentCacheTime = currentTime;
                 cacheRefreshPending = false;
+                _scanProfRefreshCount++;
             }
+
+            long afterRefresh = profiling ? _scanProfSw.ElapsedTicks : 0;
 
             try
             {
+                // Clear per-cycle dedup (each component processed at most once across all types)
+                _processedThisCycle.Clear();
+
                 bool allDone = true;
                 foreach (var type in _registeredTypes)
                 {
@@ -294,23 +283,62 @@ namespace UnityGameTranslator.Core
                 scanCycleComplete = allDone;
             }
             catch { }
+
+            if (profiling)
+            {
+                long afterBatch = _scanProfSw.ElapsedTicks;
+                _scanProfRefreshTicks += afterRefresh;
+                _scanProfBatchTicks += afterBatch - afterRefresh;
+                _scanProfCount++;
+
+                // Log every 5 seconds
+                if (currentTime - _scanProfLastLog > 5f)
+                {
+                    _scanProfLastLog = currentTime;
+                    double freq = System.Diagnostics.Stopwatch.Frequency;
+                    TranslatorCore.LogInfo($"[SCAN-PERF] {_scanProfCount} scans in 5s ({_scanProfRefreshCount} refreshes) | " +
+                        $"Refresh={_scanProfRefreshTicks/freq*1000:F1}ms | " +
+                        $"Batch={_scanProfBatchTicks/freq*1000:F1}ms");
+                    _scanProfCount = 0;
+                    _scanProfRefreshCount = 0;
+                    _scanProfRefreshTicks = 0;
+                    _scanProfBatchTicks = 0;
+                }
+            }
         }
 
         /// <summary>
-        /// Refresh caches for all registered types at once.
-        /// Only used by ForceRefreshCache() for immediate operations (font highlight, etc.).
-        /// Normal scan path uses spread refresh (one type per Scan() call).
+        /// Refresh caches for all registered types using 2-phase approach:
+        /// Phase 1: Direct scans per type (IL2CPP native, TypeHelper, Static lists) — cheap, targeted.
+        /// Phase 2: Mutualized MonoBehaviourFilter — ONE FindAllObjectsOfType(Component) call
+        ///          shared across all types that still need it. Avoids N expensive calls.
         /// </summary>
         private static void RefreshAllCaches()
         {
+            // Phase 1: Direct scans (strategies 1-3) for each type
+            var needsFilterTypes = new List<RegisteredTextType>();
+
             foreach (var type in _registeredTypes)
             {
-                type.CachedComponents = RefreshTypeCache(type);
+                type.CachedComponents = RefreshTypeCacheDirect(type);
+
                 if (!type.LoggedOnce && type.CachedComponents != null && type.CachedComponents.Length > 0)
                 {
                     TranslatorCore.LogInfo($"Scan: Found {type.CachedComponents.Length} {type.Name} components");
                     type.LoggedOnce = true;
                 }
+
+                // If direct strategies didn't find anything, check if MonoBehaviourFilter should be tried
+                if ((type.CachedComponents == null || type.CachedComponents.Length == 0) && type.NeedsMonoBehaviourFilter)
+                {
+                    needsFilterTypes.Add(type);
+                }
+            }
+
+            // Phase 2: Mutualized MonoBehaviourFilter (ONE call for ALL types that need it)
+            if (needsFilterTypes.Count > 0)
+            {
+                RefreshViaMonoBehaviourFilterShared(needsFilterTypes);
             }
         }
 
@@ -378,7 +406,9 @@ namespace UnityGameTranslator.Core
 
             var pubInst = BindingFlags.Public | BindingFlags.Instance;
 
-            // TMP_Text (base type)
+            // TMP_Text (base type) — FindAllObjectsOfType returns all subtypes
+            // (TextMeshProUGUI, TextMeshPro) via polymorphism. No need to register them separately.
+            // Subtypes are already covered by Harmony patches for real-time text interception.
             if (TypeHelper.TMP_TextType != null)
             {
                 RegisterType(new RegisteredTextType
@@ -394,44 +424,6 @@ namespace UnityGameTranslator.Core
                     NeedsForceMeshUpdate = true,
                     NeedsSetAllDirty = false
                 });
-
-                // TextMeshProUGUI - register only if different from TMP_TextType
-                Type tmproUGUI = FindType("TMPro.TextMeshProUGUI");
-                if (tmproUGUI != null && tmproUGUI != TypeHelper.TMP_TextType)
-                {
-                    RegisterType(new RegisteredTextType
-                    {
-                        Name = "TextMeshProUGUI",
-                        Category = "TMP",
-                        ComponentType = tmproUGUI,
-                        TextProp = tmproUGUI.GetProperty("text", pubInst),
-                        FontProp = tmproUGUI.GetProperty("font", pubInst),
-                        FontSizeProp = tmproUGUI.GetProperty("fontSize", pubInst),
-                        ColorProp = tmproUGUI.GetProperty("color", pubInst),
-                        FontTypeName = "TMP",
-                        NeedsForceMeshUpdate = true,
-                        NeedsSetAllDirty = false
-                    });
-                }
-
-                // TextMeshPro (3D) - register only if different from TMP_TextType
-                Type tmproPro = FindType("TMPro.TextMeshPro");
-                if (tmproPro != null && tmproPro != TypeHelper.TMP_TextType && tmproPro != tmproUGUI)
-                {
-                    RegisterType(new RegisteredTextType
-                    {
-                        Name = "TextMeshPro",
-                        Category = "TMP",
-                        ComponentType = tmproPro,
-                        TextProp = tmproPro.GetProperty("text", pubInst),
-                        FontProp = tmproPro.GetProperty("font", pubInst),
-                        FontSizeProp = tmproPro.GetProperty("fontSize", pubInst),
-                        ColorProp = tmproPro.GetProperty("color", pubInst),
-                        FontTypeName = "TMP",
-                        NeedsForceMeshUpdate = true,
-                        NeedsSetAllDirty = false
-                    });
-                }
             }
 
             // UI.Text
@@ -452,115 +444,19 @@ namespace UnityGameTranslator.Core
                 });
             }
 
-            // TextMesh (legacy 3D text)
-            if (TypeHelper.TextMeshType != null)
-            {
-                RegisterType(new RegisteredTextType
-                {
-                    Name = "TextMesh",
-                    Category = "TextMesh",
-                    ComponentType = TypeHelper.TextMeshType,
-                    TextProp = TypeHelper.TextMesh_TextProp,
-                    FontProp = TypeHelper.TextMesh_FontProp,
-                    FontSizeProp = null, // TextMesh uses characterSize, not fontSize
-                    ColorProp = TypeHelper.TextMeshType.GetProperty("color", pubInst),
-                    FontTypeName = "TextMesh",
-                    NeedsForceMeshUpdate = false,
-                    NeedsSetAllDirty = false
-                });
-            }
+            // TextMesh and alternate TMP (TMProOld) are NOT registered for scanning.
+            // They are fully covered by Harmony patches (TextMesh_SetText_Prefix,
+            // AlternateTMP_SetText_Prefix) which handle real-time text interception.
+            // The old code (pre-refactor) also did not scan them — only TMP_Text + UI.Text.
 
-            // Alternate TMP types (TMProOld, etc.) - only if not already covered
-            RegisterAlternateTMPTypes();
-
-            // Register generic types already detected by TranslatorPatches
+            // Register generic types already detected by TranslatorPatches (NGUI, etc.)
+            // These have no Harmony coverage and need scanner discovery.
             foreach (var genericType in TranslatorPatches.GenericTextTypes)
             {
                 RegisterType(genericType);
             }
 
             TranslatorCore.LogInfo($"[Scanner] Registered {_registeredTypes.Count} text component types");
-        }
-
-        /// <summary>
-        /// Register alternate TMP implementations from different namespaces (TMProOld, etc.)
-        /// </summary>
-        private static void RegisterAlternateTMPTypes()
-        {
-            if (TypeHelper.UseAlternateTMP) return; // Already handled by TMP_TextType
-
-            string[] altNamespaces = { "TMProOld", "TextMeshPro", "TMPro.Old" };
-            string[] tmpTypeNames = { "TMP_Text", "TextMeshPro", "TextMeshProUGUI" };
-            var pubInst = BindingFlags.Public | BindingFlags.Instance;
-
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                try
-                {
-                    string asmName = asm.GetName().Name;
-                    if (asmName.StartsWith("System") || asmName.StartsWith("mscorlib")) continue;
-
-                    foreach (var type in asm.GetTypes())
-                    {
-                        try
-                        {
-                            string typeName = type.Name;
-                            string typeNamespace = type.Namespace ?? "";
-
-                            // Skip standard TMPro types (already registered above)
-                            if (TypeHelper.TMP_TextType != null && (type == TypeHelper.TMP_TextType || type.IsSubclassOf(TypeHelper.TMP_TextType)))
-                                continue;
-
-                            // Check if it's a TMP-like type name
-                            bool isTmpType = false;
-                            foreach (var name in tmpTypeNames)
-                            {
-                                if (typeName == name || typeName.EndsWith(name)) { isTmpType = true; break; }
-                            }
-                            if (!isTmpType) continue;
-
-                            // Must be in an alternate namespace
-                            if (typeNamespace == "TMPro") continue;
-                            bool isAlt = false;
-                            foreach (var ns in altNamespaces)
-                            {
-                                if (typeNamespace.Contains(ns)) { isAlt = true; break; }
-                            }
-                            if (!isAlt && typeNamespace == "TMPro") continue;
-
-                            // Must have text property and be a Component
-                            var textProp = type.GetProperty("text", pubInst);
-                            if (textProp?.SetMethod == null) continue;
-                            if (!typeof(Component).IsAssignableFrom(type)) continue;
-
-                            // Already registered?
-                            bool alreadyRegistered = false;
-                            foreach (var existing in _registeredTypes)
-                            {
-                                if (existing.ComponentType == type) { alreadyRegistered = true; break; }
-                            }
-                            if (alreadyRegistered) continue;
-
-                            RegisterType(new RegisteredTextType
-                            {
-                                Name = $"{typeNamespace}.{typeName}",
-                                Category = "TMP",
-                                ComponentType = type,
-                                TextProp = textProp,
-                                FontProp = type.GetProperty("font", pubInst),
-                                FontSizeProp = type.GetProperty("fontSize", pubInst),
-                                ColorProp = type.GetProperty("color", pubInst),
-                                FontTypeName = "TMP (alt)",
-                                NeedsForceMeshUpdate = true,
-                                NeedsSetAllDirty = false
-                            });
-                            TranslatorCore.LogInfo($"[Scanner] Registered alternate TMP type: {type.FullName}");
-                        }
-                        catch { }
-                    }
-                }
-                catch { }
-            }
         }
 
         /// <summary>
@@ -616,104 +512,319 @@ namespace UnityGameTranslator.Core
         /// Refresh the component cache for a registered type.
         /// Tries multiple strategies and merges results by instance ID to avoid duplicates.
         /// </summary>
+        /// <summary>
+        /// Full refresh including MonoBehaviourFilter. Used by ForceRefreshCache() only.
+        /// Normal scan path uses RefreshAllCaches() which mutualizes MonoBehaviourFilter.
+        /// </summary>
         private static UnityEngine.Object[] RefreshTypeCache(RegisteredTextType type)
         {
-            var seenIds = new HashSet<int>();
-            var results = new List<UnityEngine.Object>();
+            var result = RefreshTypeCacheDirect(type);
+            if (result != null && result.Length > 0)
+                return result;
 
-            // Optimization B: if we already know which strategy works, use only that one
-            if (type.WinningStrategy != ScanStrategy.Unknown)
+            // Fallback to MonoBehaviourFilter for this single type
+            if (type.MonoBehaviourFilterState != StrategyState.Failed)
             {
-                switch (type.WinningStrategy)
-                {
-                    case ScanStrategy.IL2CPPNative:
-                        TryAddFromIL2CPPNative(type, results, seenIds);
-                        break;
-                    case ScanStrategy.TypeHelper:
-                        TryAddFromTypeHelper(type, results, seenIds);
-                        break;
-                    case ScanStrategy.StaticLists:
-                        TryAddFromStaticLists(type, results, seenIds);
-                        break;
-                    case ScanStrategy.MonoBehaviourFilter:
-                        TryAddFromMonoBehaviourFilter(type, results, seenIds);
-                        break;
-                }
-
-                // If the winning strategy stopped working (scene change edge case),
-                // reset and fall through to full discovery next cycle
-                if (results.Count == 0)
-                    type.WinningStrategy = ScanStrategy.Unknown;
-
-                return results.Count > 0 ? results.ToArray() : null;
-            }
-
-            // First time: try all strategies in order, record the winner
-
-            // Strategy 1: IL2CPP native scan
-            TryAddFromIL2CPPNative(type, results, seenIds);
-            if (results.Count > 0)
-            {
-                type.WinningStrategy = ScanStrategy.IL2CPPNative;
-                // Still try TypeHelper to catch additional components
-                TryAddFromTypeHelper(type, results, seenIds);
-                return results.ToArray();
-            }
-
-            // Strategy 2: TypeHelper (works for both Mono and IL2CPP)
-            TryAddFromTypeHelper(type, results, seenIds);
-            if (results.Count > 0)
-            {
-                type.WinningStrategy = ScanStrategy.TypeHelper;
-                return results.ToArray();
-            }
-
-            // Strategy 3: Static list fields (for NGUI etc.)
-            TryAddFromStaticLists(type, results, seenIds);
-            if (results.Count > 0)
-            {
-                type.WinningStrategy = ScanStrategy.StaticLists;
-                return results.ToArray();
-            }
-
-            // Strategy 4: MonoBehaviour filter fallback (expensive)
-            TryAddFromMonoBehaviourFilter(type, results, seenIds);
-            if (results.Count > 0)
-            {
-                type.WinningStrategy = ScanStrategy.MonoBehaviourFilter;
-                TranslatorCore.LogInfo($"[Scanner] {type.Name}: using MonoBehaviourFilter (expensive fallback)");
-                return results.ToArray();
+                var seenIds = new HashSet<int>();
+                var results = new List<UnityEngine.Object>();
+                TryAddFromMonoBehaviourFilter(type, results, seenIds);
+                type.MonoBehaviourFilterState = results.Count > 0 ? StrategyState.Works : StrategyState.Empty;
+                if (results.Count > 0) return results.ToArray();
             }
 
             return null;
         }
 
+        /// <summary>
+        /// Refresh cache using direct strategies only (1: IL2CPP native, 2: TypeHelper, 3: Static lists).
+        /// Does NOT use MonoBehaviourFilter — that's handled by RefreshViaMonoBehaviourFilterShared.
+        /// Tracks per-strategy state: Works/Empty/Failed to skip known-bad strategies.
+        /// PERF: When a strategy is known-Works, assigns the FindAllObjectsOfType result directly
+        /// without wrapper allocations (no HashSet, no List, no ToArray).
+        /// </summary>
+        private static UnityEngine.Object[] RefreshTypeCacheDirect(RegisteredTextType type)
+        {
+            // FAST PATH: known-working strategy → direct assignment, zero allocations
+            if (type.TypeHelperState == StrategyState.Works)
+            {
+                var found = TypeHelper.FindAllObjectsOfType(type.ComponentType);
+                if (found != null && found.Length > 0) return found;
+                type.TypeHelperState = StrategyState.Empty;
+            }
+            else if (type.IL2CPPNativeState == StrategyState.Works)
+            {
+                var found = FindAllComponentsIL2CPPCached(type.IL2CPPType);
+                if (found != null && found.Length > 0) return found;
+                type.IL2CPPNativeState = StrategyState.Empty;
+            }
+            else if (type.StaticListsState == StrategyState.Works)
+            {
+                var seenIds = new HashSet<int>();
+                var results = new List<UnityEngine.Object>();
+                TryAddFromStaticLists(type, results, seenIds);
+                if (results.Count > 0) return results.ToArray();
+                type.StaticListsState = StrategyState.Empty;
+            }
+
+            // DISCOVERY PATH: first run or winner stopped working
+            // Try all non-Failed strategies in order
+
+            // Strategy 1: IL2CPP native
+            if (type.IL2CPPNativeState != StrategyState.Failed)
+            {
+                try
+                {
+                    if (il2cppScanAvailable && type.IL2CPPType != null)
+                    {
+                        var found = FindAllComponentsIL2CPPCached(type.IL2CPPType);
+                        if (found != null && found.Length > 0)
+                        {
+                            type.IL2CPPNativeState = StrategyState.Works;
+                            return found;
+                        }
+                    }
+                    type.IL2CPPNativeState = StrategyState.Empty;
+                }
+                catch { type.IL2CPPNativeState = StrategyState.Failed; }
+            }
+
+            // Strategy 2: TypeHelper
+            if (type.TypeHelperState != StrategyState.Failed)
+            {
+                try
+                {
+                    var found = TypeHelper.FindAllObjectsOfType(type.ComponentType);
+                    if (found != null && found.Length > 0)
+                    {
+                        type.TypeHelperState = StrategyState.Works;
+                        return found;
+                    }
+                    type.TypeHelperState = StrategyState.Empty;
+                }
+                catch { type.TypeHelperState = StrategyState.Failed; }
+            }
+
+            // Strategy 3: Static lists
+            if (type.StaticListsState != StrategyState.Failed)
+            {
+                try
+                {
+                    var seenIds = new HashSet<int>();
+                    var results = new List<UnityEngine.Object>();
+                    TryAddFromStaticLists(type, results, seenIds);
+                    if (results.Count > 0)
+                    {
+                        type.StaticListsState = StrategyState.Works;
+                        return results.ToArray();
+                    }
+                    type.StaticListsState = StrategyState.Empty;
+                }
+                catch { type.StaticListsState = StrategyState.Failed; }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Mutualized MonoBehaviourFilter: ONE call to FindAllObjectsOfType(typeof(Component)),
+        /// then distribute results to all types that need it.
+        /// This avoids N expensive calls when N types all need the fallback.
+        /// </summary>
+        private static void RefreshViaMonoBehaviourFilterShared(List<RegisteredTextType> types)
+        {
+            UnityEngine.Object[] allComponents = null;
+
+            try
+            {
+                allComponents = TypeHelper.FindAllObjectsOfType(typeof(Component));
+            }
+            catch (Exception ex)
+            {
+                TranslatorCore.LogWarning($"[Scanner] MonoBehaviourFilter shared scan failed: {ex.Message}");
+                // Mark all as Failed
+                foreach (var type in types)
+                    type.MonoBehaviourFilterState = StrategyState.Failed;
+                return;
+            }
+
+            if (allComponents == null || allComponents.Length == 0)
+            {
+                foreach (var type in types)
+                    type.MonoBehaviourFilterState = StrategyState.Empty;
+                return;
+            }
+
+            // Build per-type result lists from the single shared scan
+            var typeResults = new Dictionary<RegisteredTextType, List<UnityEngine.Object>>();
+            var typeSeenIds = new Dictionary<RegisteredTextType, HashSet<int>>();
+            foreach (var type in types)
+            {
+                typeResults[type] = new List<UnityEngine.Object>();
+                typeSeenIds[type] = new HashSet<int>();
+
+                // Pre-populate seenIds from existing cache (if any partial results from Phase 1)
+                if (type.CachedComponents != null)
+                {
+                    foreach (var obj in type.CachedComponents)
+                    {
+                        if (obj != null) typeSeenIds[type].Add(obj.GetInstanceID());
+                    }
+                }
+            }
+
+            // Single pass over all components, distribute to matching types
+            foreach (var obj in allComponents)
+            {
+                if (obj == null) continue;
+
+                foreach (var type in types)
+                {
+                    bool matches = false;
+
+                    // Try IsInstanceOfType first (works on Mono)
+                    try { matches = type.ComponentType.IsInstanceOfType(obj); }
+                    catch { }
+
+                    // Fallback: match by type name (handles IL2CPP proxy types)
+                    if (!matches)
+                    {
+                        var objType = obj.GetType();
+                        string targetName = type.ComponentType.Name;
+                        if (targetName.StartsWith("Il2Cpp")) targetName = targetName.Substring(6);
+
+                        var current = objType;
+                        while (current != null)
+                        {
+                            string name = current.Name;
+                            if (name.StartsWith("Il2Cpp")) name = name.Substring(6);
+                            if (name == targetName) { matches = true; break; }
+                            current = current.BaseType;
+                        }
+                    }
+
+                    if (matches)
+                    {
+                        int id = obj.GetInstanceID();
+                        if (typeSeenIds[type].Add(id))
+                            typeResults[type].Add(obj);
+                    }
+                }
+            }
+
+            // Apply results
+            foreach (var type in types)
+            {
+                var results = typeResults[type];
+                if (results.Count > 0)
+                {
+                    // Merge with any existing cache from Phase 1
+                    if (type.CachedComponents != null && type.CachedComponents.Length > 0)
+                    {
+                        var merged = new List<UnityEngine.Object>(type.CachedComponents);
+                        merged.AddRange(results);
+                        type.CachedComponents = merged.ToArray();
+                    }
+                    else
+                    {
+                        type.CachedComponents = results.ToArray();
+                    }
+
+                    type.MonoBehaviourFilterState = StrategyState.Works;
+
+                    if (!type.LoggedOnce)
+                    {
+                        TranslatorCore.LogInfo($"Scan: Found {results.Count} {type.Name} via MonoBehaviourFilter (shared scan)");
+                        type.LoggedOnce = true;
+                    }
+                }
+                else
+                {
+                    type.MonoBehaviourFilterState = StrategyState.Empty;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Strategy 1: IL2CPP native scan via cached Il2CppType.
+        /// Throws on fundamental failure (marks strategy as Failed).
+        /// </summary>
         private static void TryAddFromIL2CPPNative(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
         {
             if (!il2cppScanAvailable || type.IL2CPPType == null) return;
 
-            try
+            // Let exceptions propagate for strategy state tracking
+            var found = FindAllComponentsIL2CPPCached(type.IL2CPPType);
+            if (found == null) return;
+            foreach (var obj in found)
             {
-                var found = FindAllComponentsIL2CPPCached(type.IL2CPPType);
-                if (found == null) return;
-                foreach (var obj in found)
-                {
-                    if (obj == null) continue;
-                    int id = obj.GetInstanceID();
-                    if (seenIds.Add(id))
-                        results.Add(obj);
-                }
+                if (obj == null) continue;
+                int id = obj.GetInstanceID();
+                if (seenIds.Add(id))
+                    results.Add(obj);
             }
-            catch { }
         }
 
+        /// <summary>
+        /// Strategy 2: TypeHelper (Resources.FindObjectsOfTypeAll).
+        /// Throws on fundamental failure (marks strategy as Failed).
+        /// </summary>
         private static void TryAddFromTypeHelper(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
         {
-            try
+            // Let exceptions propagate for strategy state tracking
+            var found = TypeHelper.FindAllObjectsOfType(type.ComponentType);
+            if (found == null) return;
+            foreach (var obj in found)
             {
-                var found = TypeHelper.FindAllObjectsOfType(type.ComponentType);
-                if (found == null) return;
-                foreach (var obj in found)
+                if (obj == null) continue;
+                int id = obj.GetInstanceID();
+                if (seenIds.Add(id))
+                    results.Add(obj);
+            }
+        }
+
+        /// <summary>
+        /// Strategy 3: Static list fields (NGUI mList, etc.).
+        /// Throws on fundamental failure (marks strategy as Failed).
+        /// </summary>
+        private static void TryAddFromStaticLists(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
+        {
+            var componentType = type.ComponentType;
+            var staticFields = componentType.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+            string[] listFieldNames = { "mList", "sList", "s_Instances", "instances", "allInstances", "s_list" };
+
+            foreach (var field in staticFields)
+            {
+                var fieldType = field.FieldType;
+                if (fieldType == null) continue;
+
+                bool nameMatch = false;
+                foreach (var knownName in listFieldNames)
+                {
+                    if (string.Equals(field.Name, knownName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        nameMatch = true;
+                        break;
+                    }
+                }
+
+                if (!nameMatch)
+                {
+                    string ftName = fieldType.Name ?? "";
+                    if (!ftName.Contains("List") && !ftName.Contains("Array") &&
+                        !ftName.Contains("Collection") && !ftName.Contains("HashSet"))
+                        continue;
+                }
+
+                object listObj = null;
+                try { listObj = field.GetValue(null); }
+                catch { continue; }
+                if (listObj == null) continue;
+
+                var items = ExtractObjectsFromList(listObj, componentType);
+                if (items == null) continue;
+
+                foreach (var obj in items)
                 {
                     if (obj == null) continue;
                     int id = obj.GetInstanceID();
@@ -721,59 +832,6 @@ namespace UnityGameTranslator.Core
                         results.Add(obj);
                 }
             }
-            catch { }
-        }
-
-        private static void TryAddFromStaticLists(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
-        {
-            try
-            {
-                var componentType = type.ComponentType;
-                var staticFields = componentType.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-
-                string[] listFieldNames = { "mList", "sList", "s_Instances", "instances", "allInstances", "s_list" };
-
-                foreach (var field in staticFields)
-                {
-                    var fieldType = field.FieldType;
-                    if (fieldType == null) continue;
-
-                    bool nameMatch = false;
-                    foreach (var knownName in listFieldNames)
-                    {
-                        if (string.Equals(field.Name, knownName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            nameMatch = true;
-                            break;
-                        }
-                    }
-
-                    if (!nameMatch)
-                    {
-                        string ftName = fieldType.Name ?? "";
-                        if (!ftName.Contains("List") && !ftName.Contains("Array") &&
-                            !ftName.Contains("Collection") && !ftName.Contains("HashSet"))
-                            continue;
-                    }
-
-                    object listObj = null;
-                    try { listObj = field.GetValue(null); }
-                    catch { continue; }
-                    if (listObj == null) continue;
-
-                    var items = ExtractObjectsFromList(listObj, componentType);
-                    if (items == null) continue;
-
-                    foreach (var obj in items)
-                    {
-                        if (obj == null) continue;
-                        int id = obj.GetInstanceID();
-                        if (seenIds.Add(id))
-                            results.Add(obj);
-                    }
-                }
-            }
-            catch { }
         }
 
         private static void TryAddFromMonoBehaviourFilter(RegisteredTextType type, List<UnityEngine.Object> results, HashSet<int> seenIds)
@@ -944,6 +1002,11 @@ namespace UnityGameTranslator.Core
                 if (comp == null) return;
 
                 int instanceId = comp.GetInstanceID();
+
+                // Per-cycle dedup: skip if already processed through another overlapping type
+                // (e.g. TMP_Text scan includes TextMeshProUGUI components)
+                if (!_processedThisCycle.Add(instanceId))
+                    return;
 
                 // Skip if own UI and should not be translated
                 if (TranslatorCore.ShouldSkipTranslation(comp))

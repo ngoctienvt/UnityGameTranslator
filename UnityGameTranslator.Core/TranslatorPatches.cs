@@ -32,22 +32,44 @@ namespace UnityGameTranslator.Core
         internal object IL2CPPType;                          // Cached Il2CppType.Of<T>() result
         internal MethodInfo TryCastMethod;                   // Cached TryCast<T> generic method
 
-        // Discovery strategy cache (optimization B: skip strategies known to fail)
-        internal ScanStrategy WinningStrategy = ScanStrategy.Unknown;
+        // Per-strategy state tracking (skip strategies known to fail, prefer strategies known to work)
+        // Reset to Unknown on scene change.
+        internal StrategyState IL2CPPNativeState = StrategyState.Unknown;
+        internal StrategyState TypeHelperState = StrategyState.Unknown;
+        internal StrategyState StaticListsState = StrategyState.Unknown;
+        internal StrategyState MonoBehaviourFilterState = StrategyState.Unknown;
+
+        /// <summary>
+        /// Reset all strategy states to Unknown (call on scene change).
+        /// </summary>
+        internal void ResetStrategyStates()
+        {
+            IL2CPPNativeState = StrategyState.Unknown;
+            TypeHelperState = StrategyState.Unknown;
+            StaticListsState = StrategyState.Unknown;
+            MonoBehaviourFilterState = StrategyState.Unknown;
+        }
+
+        /// <summary>
+        /// Returns true if this type needs the mutualized MonoBehaviourFilter scan.
+        /// True when: no direct strategy Works AND MonoBehaviourFilter is not Failed.
+        /// </summary>
+        internal bool NeedsMonoBehaviourFilter =>
+            IL2CPPNativeState != StrategyState.Works &&
+            TypeHelperState != StrategyState.Works &&
+            StaticListsState != StrategyState.Works &&
+            MonoBehaviourFilterState != StrategyState.Failed;
     }
 
     /// <summary>
-    /// Which discovery strategy succeeded for a RegisteredTextType.
-    /// Once known, only that strategy is retried on subsequent refreshes.
-    /// Reset on scene change to handle new assemblies/types.
+    /// State of a discovery strategy for a specific type.
     /// </summary>
-    public enum ScanStrategy
+    public enum StrategyState
     {
-        Unknown = 0,          // Not yet determined — try all strategies
-        IL2CPPNative = 1,
-        TypeHelper = 2,
-        StaticLists = 3,
-        MonoBehaviourFilter = 4
+        Unknown = 0,  // Not yet tried
+        Works = 1,    // Returned results — use this strategy
+        Empty = 2,    // Ran without error but found 0 components — retry (components may appear later)
+        Failed = 3    // Exception thrown — never retry this session
     }
 
     /// <summary>
@@ -460,6 +482,7 @@ namespace UnityGameTranslator.Core
         public static void GenericText_SetText_Prefix(object __instance, ref string value)
         {
             if (string.IsNullOrEmpty(value)) return;
+            if (!TranslatorCore.Config.enable_translations) return;
             try
             {
                 var component = __instance as Component;
@@ -513,6 +536,7 @@ namespace UnityGameTranslator.Core
         public static void GenericText_GetText_Postfix(object __instance, ref string __result)
         {
             if (string.IsNullOrEmpty(__result)) return;
+            if (!TranslatorCore.Config.enable_translations) return;
             try
             {
                 var component = __instance as Component;
@@ -1380,6 +1404,8 @@ namespace UnityGameTranslator.Core
         public static void ClearCache()
         {
             inputFieldTextCache.Clear();
+            _altTMPFontReplacedIds.Clear();
+            _fontNameCache.Clear();
         }
 
         /// <summary>
@@ -1537,6 +1563,13 @@ namespace UnityGameTranslator.Core
             if (instance == null || string.IsNullOrEmpty(fontName)) return;
 
             float scale = FontManager.GetFontScale(fontName);
+            // Fast exit: if scale is 1.0 and we haven't stored an original size, nothing to do
+            if (Math.Abs(scale - 1.0f) < 0.001f)
+            {
+                int quickId = TypeHelper.GetInstanceID(instance);
+                if (quickId == -1 || !_originalFontSizes.ContainsKey(quickId))
+                    return;
+            }
             int instanceId = TypeHelper.GetInstanceID(instance);
             if (instanceId == -1) return;
 
@@ -1567,72 +1600,104 @@ namespace UnityGameTranslator.Core
         /// Shared prefix logic for TMP/UI/TextMesh text patches.
         /// Handles font registration, InputField exclusion, translation, and font scale.
         /// </summary>
+        // Cache font name per component instanceId (avoids GetFont reflection on every set_text)
+        // Key: instanceId, Value: font name (null if no font). Cleared on scene change.
+        private static readonly Dictionary<int, string> _fontNameCache = new Dictionary<int, string>();
+
+        // === PROFILING (activate via debug file in plugin folder) ===
+        private static readonly System.Diagnostics.Stopwatch _profSw = new System.Diagnostics.Stopwatch();
+        private static long _profCallCount = 0;
+        private static long _profSkipTranslation = 0;
+        private static long _profGetFont = 0;
+        private static long _profFontOps = 0;
+        private static long _profTranslate = 0;
+        private static long _profFontScale = 0;
+        private static long _profTotal = 0;
+        private static float _profLastLog = 0f;
+
         private static void ProcessTextPatchPrefix(object __instance, ref string textValue, string componentType)
         {
             if (string.IsNullOrEmpty(textValue)) return;
+
+            // Early exit: translations globally disabled → zero overhead
+            if (!TranslatorCore.Config.enable_translations) return;
+
+            bool profiling = TranslatorCore.DebugMode;
+            long t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
+            if (profiling) _profSw.Restart();
 
             try
             {
                 var comp = __instance as Component;
                 if (comp == null) return;
 
+                if (profiling) t0 = _profSw.ElapsedTicks;
+
                 // Skip if part of our own UI and should not be translated (uses hierarchy check)
                 if (TranslatorCore.ShouldSkipTranslation(comp)) return;
 
+                if (profiling) { t1 = _profSw.ElapsedTicks; _profSkipTranslation += t1 - t0; }
+
+                int compId = TypeHelper.GetInstanceID(__instance);
                 string fontName = null;
                 string settingsFontName = null;
+                object fontObj = null;
 
-                // Register font for fallback management
-                object fontObj = TypeHelper.GetFont(__instance);
-                if (fontObj != null)
+                // Get font name (cached to avoid GetFont reflection on every call)
+                if (compId != -1 && _fontNameCache.TryGetValue(compId, out string cachedFontName))
                 {
-                    fontName = (fontObj is UnityEngine.Object uobj) ? uobj.name : null;
-                    if (!string.IsNullOrEmpty(fontName))
+                    fontName = cachedFontName;
+                }
+                else
+                {
+                    fontObj = TypeHelper.GetFont(__instance);
+                    if (fontObj != null)
+                        fontName = (fontObj is UnityEngine.Object uobj) ? uobj.name : null;
+                    if (compId != -1)
+                        _fontNameCache[compId] = fontName;
+                }
+
+                if (profiling) { t2 = _profSw.ElapsedTicks; _profGetFont += t2 - t1; }
+
+                if (!string.IsNullOrEmpty(fontName))
+                {
+                    settingsFontName = FontManager.GetSettingsFontName(compId, fontName);
+
+                    FontManager.RegisterFontByName(settingsFontName, componentType);
+                    FontManager.IncrementUsageCount(settingsFontName);
+
+                    // Skip translation if disabled for this font
+                    if (!FontManager.IsTranslationEnabled(settingsFontName))
+                        return;
+
+                    // Font replacement operations
+                    if (componentType == "TMP")
                     {
-                        // Check if this is a replaced font — use original name for settings
-                        int compId = TypeHelper.GetInstanceID(__instance);
-                        settingsFontName = FontManager.GetSettingsFontName(compId, fontName);
+                        if (fontObj == null) fontObj = TypeHelper.GetFont(__instance);
+                        FontManager.ApplyFontReplacement(__instance, fontObj, settingsFontName);
+                    }
+                    else if (componentType == "Unity")
+                    {
+                        if (fontObj == null) fontObj = TypeHelper.GetFont(__instance);
+                        FontManager.RegisterUnityFontObject(settingsFontName, fontObj);
 
-                        FontManager.RegisterFontByName(settingsFontName, componentType);
-                        FontManager.IncrementUsageCount(settingsFontName);
-
-                        // Store Unity Font objects for IL2CPP fallback (FindObjectsOfTypeAll fails)
-                        if (componentType == "Unity")
-                            FontManager.RegisterUnityFontObject(settingsFontName, fontObj);
-
-                        // Skip translation if disabled for this font
-                        if (!FontManager.IsTranslationEnabled(settingsFontName))
-                            return;
-
-                        // Apply replacement font: SetFont to custom/system font,
-                        // add original game font as fallback on the replacement
-                        // (so missing chars fall back to original, not the other way)
-                        if (componentType == "TMP")
+                        var replacementFont = FontManager.GetUnityReplacementFont(settingsFontName);
+                        if (replacementFont != null)
                         {
-                            FontManager.ApplyFontReplacement(__instance, fontObj, settingsFontName);
+                            FontManager.TrackOriginalFont(compId, fontObj);
+                            string currentName = (fontObj is UnityEngine.Object co) ? co.name : null;
+                            string replaceName = replacementFont.name;
+                            if (currentName != replaceName)
+                                TypeHelper.SetFont(__instance, replacementFont);
                         }
-                        else if (componentType == "Unity")
+                        else if (FontManager.HasFallbackConfigured(settingsFontName))
                         {
-                            var replacementFont = FontManager.GetUnityReplacementFont(settingsFontName);
-                            if (replacementFont != null)
-                            {
-                                int instId = TypeHelper.GetInstanceID(__instance);
-                                if (instId != -1)
-                                    FontManager.TrackOriginalFont(instId, fontObj);
-
-                                string currentName = (fontObj is UnityEngine.Object co) ? co.name : null;
-                                string replaceName = replacementFont.name;
-                                if (currentName != replaceName)
-                                    TypeHelper.SetFont(__instance, replacementFont);
-                            }
-                            else if (FontManager.HasFallbackConfigured(settingsFontName))
-                            {
-                                // Unity Font creation failed (IL2CPP) — try converting to TMP
-                                FontManager.ConvertUITextToTMP(comp, settingsFontName, textValue);
-                            }
+                            FontManager.ConvertUITextToTMP(comp, settingsFontName, textValue);
                         }
                     }
                 }
+
+                if (profiling) { t3 = _profSw.ElapsedTicks; _profFontOps += t3 - t2; }
 
                 // Don't translate InputField textComponent (user's typed text)
                 if (componentType != "TextMesh" && IsInputFieldTextComponentCached(__instance)) return;
@@ -1641,8 +1706,40 @@ namespace UnityGameTranslator.Core
                 bool isOwnUI = TranslatorCore.IsOwnUITranslatable(comp);
                 textValue = TranslatorCore.TranslateTextWithTracking(textValue, comp, isOwnUI);
 
+                if (profiling) { t4 = _profSw.ElapsedTicks; _profTranslate += t4 - t3; }
+
                 // Apply font scale if configured for this font
                 ApplyFontScale(__instance, settingsFontName ?? fontName);
+
+                if (profiling)
+                {
+                    t5 = _profSw.ElapsedTicks;
+                    _profFontScale += t5 - t4;
+                    _profTotal += t5;
+                    _profCallCount++;
+
+                    // Log profiling summary every 5 seconds
+                    float now = Time.realtimeSinceStartup;
+                    if (now - _profLastLog > 5f)
+                    {
+                        _profLastLog = now;
+                        double freq = System.Diagnostics.Stopwatch.Frequency;
+                        TranslatorCore.LogInfo($"[PERF] {_profCallCount} calls in 5s | " +
+                            $"ShouldSkip={_profSkipTranslation/freq*1000:F1}ms | " +
+                            $"GetFont={_profGetFont/freq*1000:F1}ms | " +
+                            $"FontOps={_profFontOps/freq*1000:F1}ms | " +
+                            $"Translate={_profTranslate/freq*1000:F1}ms | " +
+                            $"Scale={_profFontScale/freq*1000:F1}ms | " +
+                            $"TOTAL={_profTotal/freq*1000:F1}ms");
+                        _profCallCount = 0;
+                        _profSkipTranslation = 0;
+                        _profGetFont = 0;
+                        _profFontOps = 0;
+                        _profTranslate = 0;
+                        _profFontScale = 0;
+                        _profTotal = 0;
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -1736,8 +1833,13 @@ namespace UnityGameTranslator.Core
             return null;
         }
 
+        // Cached PropertyInfo for alternate TMP font access (avoids GetProperty reflection on every call)
+        private static readonly Dictionary<Type, PropertyInfo> _altTMPFontPropCache = new Dictionary<Type, PropertyInfo>();
+        private static readonly Dictionary<Type, PropertyInfo> _altTMPFontSizePropCache = new Dictionary<Type, PropertyInfo>();
+
         /// <summary>
         /// Try to get font name from an alternate TMP component via reflection.
+        /// PropertyInfo is cached per type to avoid repeated reflection.
         /// </summary>
         private static string TryGetAlternateTMPFontName(object instance)
         {
@@ -1747,8 +1849,13 @@ namespace UnityGameTranslator.Core
             {
                 var type = instance.GetType();
 
-                // Try "font" property (TMP_FontAsset)
-                var fontProp = type.GetProperty("font", BindingFlags.Public | BindingFlags.Instance);
+                PropertyInfo fontProp;
+                if (!_altTMPFontPropCache.TryGetValue(type, out fontProp))
+                {
+                    fontProp = type.GetProperty("font", BindingFlags.Public | BindingFlags.Instance);
+                    _altTMPFontPropCache[type] = fontProp;
+                }
+
                 if (fontProp != null)
                 {
                     var fontObj = fontProp.GetValue(instance, null);
@@ -1869,49 +1976,67 @@ namespace UnityGameTranslator.Core
         /// Also applies font scale if configured.
         /// NOTE: This should only be called when UI is initialized (caller must check).
         /// </summary>
+        // Cache of components already font-replaced (avoids redundant reflection per set_text)
+        private static readonly HashSet<int> _altTMPFontReplacedIds = new HashSet<int>();
+
         private static void TryApplyAlternateTMPReplacementFont(object instance, string originalFontName)
         {
             if (instance == null || string.IsNullOrEmpty(originalFontName)) return;
 
+            // Early exit: check if fallback is even configured before any reflection
+            string fallbackName = FontManager.GetConfiguredFallback(originalFontName);
+            bool hasFallback = !string.IsNullOrEmpty(fallbackName);
+
+            // Early exit: if no fallback and font search already done, nothing to do
+            if (!hasFallback && _alternateTMPFontSearchDone)
+                return;
+
             try
             {
                 var type = instance.GetType();
+                int instId = TypeHelper.GetInstanceID(instance);
 
-                // Apply font scale if configured
+                // Apply font scale if configured (use cached PropertyInfo)
                 float scale = FontManager.GetFontScale(originalFontName);
                 if (Math.Abs(scale - 1.0f) > 0.01f)
                 {
-                    // Try to apply scale via fontSize property
-                    var fontSizeProp = type.GetProperty("fontSize", BindingFlags.Public | BindingFlags.Instance);
+                    PropertyInfo fontSizeProp;
+                    if (!_altTMPFontSizePropCache.TryGetValue(type, out fontSizeProp))
+                    {
+                        fontSizeProp = type.GetProperty("fontSize", BindingFlags.Public | BindingFlags.Instance);
+                        _altTMPFontSizePropCache[type] = fontSizeProp;
+                    }
+
                     if (fontSizeProp != null && fontSizeProp.CanRead && fontSizeProp.CanWrite)
                     {
                         var currentSize = fontSizeProp.GetValue(instance, null);
                         if (currentSize is float floatSize)
                         {
-                            // Store original size to avoid compounding scale
-                            string instanceKey = TypeHelper.GetInstanceID(instance).ToString();
+                            string instanceKey = instId.ToString();
                             if (!_alternateTMPOriginalSizes.TryGetValue(instanceKey, out float originalSize))
                             {
                                 originalSize = floatSize;
                                 _alternateTMPOriginalSizes[instanceKey] = originalSize;
                             }
                             float newSize = originalSize * scale;
-                            fontSizeProp.SetValue(instance, newSize, null);
+                            if (Math.Abs(floatSize - newSize) > 0.1f)
+                                fontSizeProp.SetValue(instance, newSize, null);
                         }
-                    }
-                    else
-                    {
-                        TranslatorCore.LogWarning($"[AlternateTMP] No fontSize property found on {type.Name}");
                     }
                 }
 
-                // Get font property and search for available fonts (even if no fallback configured)
-                // This populates the cache so dropdown can show available fonts
-                var fontProp = type.GetProperty("font", BindingFlags.Public | BindingFlags.Instance);
-                if (fontProp != null)
+                // Get font property (cached) and do one-time font search
+                PropertyInfo fontProp;
+                if (!_altTMPFontPropCache.TryGetValue(type, out fontProp))
+                {
+                    fontProp = type.GetProperty("font", BindingFlags.Public | BindingFlags.Instance);
+                    _altTMPFontPropCache[type] = fontProp;
+                }
+
+                if (fontProp != null && !_alternateTMPFontSearchDone)
                 {
                     var currentFont = fontProp.GetValue(instance, null);
-                    if (currentFont != null && !_alternateTMPFontSearchDone)
+                    if (currentFont != null)
                     {
                         Type fontAssetType = currentFont.GetType();
                         _alternateTMPFontAssetType = fontAssetType;
@@ -1920,10 +2045,11 @@ namespace UnityGameTranslator.Core
                     }
                 }
 
-                // Get configured fallback font name
-                string fallbackName = FontManager.GetConfiguredFallback(originalFontName);
-                TranslatorCore.LogInfo($"[AlternateTMP] Fallback for '{originalFontName}': '{fallbackName ?? "(none)"}'");
-                if (string.IsNullOrEmpty(fallbackName)) return;
+                if (!hasFallback) return;
+
+                // Skip if already replaced for this component (avoid redundant reflection every set_text)
+                if (instId != -1 && _altTMPFontReplacedIds.Contains(instId))
+                    return;
 
                 if (fontProp == null)
                 {
@@ -1984,12 +2110,15 @@ namespace UnityGameTranslator.Core
                 if (currentFontName == replacementName && !string.IsNullOrEmpty(currentFontName)) return;
 
                 // Store original font for restore (via FontManager tracking)
-                int instId = TypeHelper.GetInstanceID(instance);
                 if (instId != -1 && originalFont != null)
                     FontManager.TrackOriginalFont(instId, originalFont);
 
                 // Replace the font: replacement becomes PRIMARY
                 fontProp.SetValue(instance, replacementAsset, null);
+
+                // Mark as replaced to skip redundant work on next set_text
+                if (instId != -1)
+                    _altTMPFontReplacedIds.Add(instId);
 
                 // Set material to match the replacement font
                 try
@@ -2258,6 +2387,7 @@ namespace UnityGameTranslator.Core
         public static void AlternateTMP_SetText_Prefix(object __instance, ref string __0)
         {
             if (string.IsNullOrEmpty(__0)) return;
+            if (!TranslatorCore.Config.enable_translations) return;
             try
             {
                 // Skip if this is a text re-set for glyph regeneration (avoid re-translation)
@@ -2328,36 +2458,11 @@ namespace UnityGameTranslator.Core
         /// </summary>
         public static void AlternateTMP_GetText_Postfix(object __instance, ref string __result)
         {
-            if (string.IsNullOrEmpty(__result)) return;
-            try
-            {
-                var component = __instance as Component;
-                if (component == null) return;
-
-                // Skip if part of our own UI
-                if (TranslatorCore.ShouldSkipTranslation(component)) return;
-
-                // Check font-based enable/disable and apply font replacement only
-                string fontName = TryGetAlternateTMPFontName(__instance);
-                if (!string.IsNullOrEmpty(fontName))
-                {
-                    // Skip if already a custom font (avoid infinite loop)
-                    if (!FontManager.IsCustomFont(fontName))
-                    {
-                        FontManager.RegisterFontByName(fontName, "TMP (alt)");
-                        // Don't increment usage count here - it's already done in setter
-                        if (!FontManager.IsTranslationEnabled(fontName))
-                            return;
-
-                        // Try to apply replacement font (font should be initialized now)
-                        TryApplyAlternateTMPReplacementFont(__instance, fontName);
-                    }
-                }
-
-                // NOTE: No translation here! Translation happens in setter prefix.
-                // Translating in getter would re-translate already-translated text.
-            }
-            catch { }
+            // PERF: Getter postfix kept minimal — no font replacement here.
+            // Font replacement is handled by the setter prefix (AlternateTMP_SetText_Prefix).
+            // Getters fire very frequently (layout, localization systems reading values)
+            // and the previous font replacement + reflection calls here were a major perf drain.
+            // Translation also doesn't happen here (would re-translate already-translated text).
         }
 
         // Track instances currently being processed to avoid recursion
@@ -2412,6 +2517,7 @@ namespace UnityGameTranslator.Core
         public static void Tk2dTextMesh_SetText_Prefix(object __instance, ref string value)
         {
             if (string.IsNullOrEmpty(value)) return;
+            if (!TranslatorCore.Config.enable_translations) return;
             try
             {
                 // tk2dTextMesh inherits from MonoBehaviour, so cast to Component for hierarchy checks
@@ -2445,6 +2551,7 @@ namespace UnityGameTranslator.Core
         public static void Tk2dTextMesh_GetText_Postfix(object __instance, ref string __result)
         {
             if (string.IsNullOrEmpty(__result)) return;
+            if (!TranslatorCore.Config.enable_translations) return;
             try
             {
                 var component = __instance as Component;
