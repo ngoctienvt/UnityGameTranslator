@@ -88,10 +88,6 @@ namespace UnityGameTranslator.Core
         // Permanent backup — never cleared. Prevents cumulative scaling.
         private static readonly Dictionary<int, float> _trueOriginalFontSizes = new Dictionary<int, float>();
 
-        // When true, ApplyFontScale bumps fontSize +1 to force font re-rasterization.
-        // Set by ForceFontSizeBump(), reset by ResetFontSizeBump() after the refresh cycle.
-        private static bool _fontSizeBumpActive = false;
-
         // Generically detected text component types (NGUI UILabel, SuperTextMesh, etc.)
         private static readonly List<RegisteredTextType> _genericTextTypes = new List<RegisteredTextType>();
 
@@ -1435,20 +1431,6 @@ namespace UnityGameTranslator.Core
         }
 
         /// <summary>
-        /// Force a font size bump on next ApplyFontScale cycle.
-        /// This triggers Unity to re-rasterize glyphs (needed after fontNames change on IL2CPP).
-        /// </summary>
-        public static void ForceFontSizeBump()
-        {
-            _fontSizeBumpActive = true;
-        }
-
-        public static void ResetFontSizeBump()
-        {
-            _fontSizeBumpActive = false;
-        }
-
-        /// <summary>
         /// Schedule a delayed scan to apply font replacements to TMP components.
         /// Called after scene change to catch early-initialized text.
         /// </summary>
@@ -1593,8 +1575,7 @@ namespace UnityGameTranslator.Core
 
             float scale = FontManager.GetFontScale(fontName);
             // Fast exit: if scale is 1.0 and we haven't stored an original size, nothing to do
-            // Unless a font size bump is pending (forces re-rasterization after fontNames change)
-            if (Math.Abs(scale - 1.0f) < 0.001f && !_fontSizeBumpActive)
+            if (Math.Abs(scale - 1.0f) < 0.001f)
             {
                 int quickId = TypeHelper.GetInstanceID(instance);
                 if (quickId == -1 || !_originalFontSizes.ContainsKey(quickId))
@@ -1616,15 +1597,6 @@ namespace UnityGameTranslator.Core
             }
 
             float targetSize = originalSize * scale;
-
-            if (_fontSizeBumpActive)
-            {
-                // Font re-rasterization hack: set originalSize+1 to force Unity re-rasterize.
-                _bypassFontSizePrefix = true;
-                TypeHelper.SetFontSize(instance, originalSize + 1);
-                _bypassFontSizePrefix = false;
-                return;
-            }
 
             float currentSize = TypeHelper.GetFontSize(instance);
             if (currentSize >= 0 && Math.Abs(currentSize - targetSize) > 0.1f)
@@ -1741,11 +1713,6 @@ namespace UnityGameTranslator.Core
                             if (currentName != replaceName)
                                 TypeHelper.SetFont(__instance, replacementFont);
                         }
-                        // UI.Text → TMP conversion disabled for now (causes crashes)
-                        // else if (FontManager.HasFallbackConfigured(settingsFontName))
-                        // {
-                        //     FontManager.ConvertUITextToTMP(comp, settingsFontName, textValue);
-                        // }
                     }
                 }
 
