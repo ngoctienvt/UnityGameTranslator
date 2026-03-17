@@ -489,8 +489,9 @@ namespace UnityGameTranslator.Core
                 if (!_originalFontsPerComponent.TryGetValue(instanceId, out var originalFont))
                     continue;
 
-                var component = FindComponentByInstanceId(instanceId);
-                if (component != null)
+                // Use stored component ref (properly typed from Harmony __instance)
+                // instead of FindComponentByInstanceId which returns untyped Object on IL2CPP
+                if (_replacedComponentRefs.TryGetValue(instanceId, out var component) && component != null)
                 {
                     TypeHelper.SetFont(component, originalFont);
                     SetFontSharedMaterial(component, originalFont);
@@ -498,6 +499,7 @@ namespace UnityGameTranslator.Core
                 }
 
                 _originalFontsPerComponent.Remove(instanceId);
+                _replacedComponentRefs.Remove(instanceId);
                 _fontReplacedComponentIds.Remove(instanceId);
             }
         }
@@ -530,15 +532,6 @@ namespace UnityGameTranslator.Core
             {
                 TranslatorCore.LogWarning($"[FontReplace] SetFontSharedMaterial failed: {ex.Message}");
             }
-        }
-
-        /// <summary>
-        /// Searches through scanner caches to find the Unity Object.
-        /// </summary>
-        private static object FindComponentByInstanceId(int instanceId)
-        {
-            // Use the scanner's unified cache (covers all registered types, works on IL2CPP)
-            return TranslatorScanner.FindCachedComponentById(instanceId);
         }
 
         /// <summary>
@@ -662,6 +655,8 @@ namespace UnityGameTranslator.Core
         /// </summary>
         // Track original fonts per component instance ID (for restore on toggle)
         private static readonly Dictionary<int, object> _originalFontsPerComponent = new Dictionary<int, object>();
+        // Track the actual component references (typed from Harmony __instance, needed for IL2CPP restore)
+        private static readonly Dictionary<int, object> _replacedComponentRefs = new Dictionary<int, object>();
 
         /// <summary>
         /// Apply font replacement: SetFont to the replacement, add original as fallback.
@@ -691,10 +686,11 @@ namespace UnityGameTranslator.Core
                 return;
             }
 
-            // Store original font for this component (for restore)
+            // Store original font and component ref for this component (for restore)
             if (instanceId != -1 && !_originalFontsPerComponent.ContainsKey(instanceId))
             {
                 _originalFontsPerComponent[instanceId] = originalFontObj;
+                _replacedComponentRefs[instanceId] = component;
             }
 
             // SetFont to replacement
@@ -2192,6 +2188,7 @@ namespace UnityGameTranslator.Core
             _fallbackAppliedFonts.Clear();
             _fontReplacedComponentIds.Clear();
             _originalFontsPerComponent.Clear();
+            _replacedComponentRefs.Clear();
         }
 
         /// <summary>
